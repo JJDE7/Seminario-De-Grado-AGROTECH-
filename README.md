@@ -1,6 +1,6 @@
 # AgroTech - Dashboard, API REST y Machine Learning
 
-Plataforma de software para el monitoreo agrícola, desarrollada para gestionar la recepción, almacenamiento, análisis y visualización de datos provenientes de nodos de sensores en campo. Este repositorio consolida el trabajo asignado al **Equipo B**, enfocándose en el backend, la interfaz de usuario y la detección de anomalías mediante Inteligencia Artificial.
+Plataforma de software para el monitoreo agrícola, desarrollada para gestionar la recepción, almacenamiento, análisis y visualización de datos provenientes de nodos de sensores en campo. Este repositorio consolida el trabajo asignado al **Equipo B**, enfocándose en el backend, la interfaz de usuario y la detección de anomalías mediante un algoritmo llamado Insolation Forest (Machine Learning).
 
 El sistema abandona el uso de WebSockets en favor de un flujo más robusto y estandarizado utilizando MQTT para telemetría en tiempo real y una API REST (FastAPI) para la integración y consulta de datos.
 
