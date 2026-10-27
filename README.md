@@ -1,14 +1,17 @@
 # AgroTech - Dashboard, API REST y Machine Learning
 
-Plataforma de software para el monitoreo agrícola, desarrollada para gestionar la recepción, almacenamiento, análisis y visualización de datos provenientes de nodos de sensores en campo. Este repositorio consolida el trabajo asignado al **Equipo B**, enfocándose en el backend, la interfaz de usuario y la detección de anomalías mediante un algoritmo llamado Insolation Forest (Machine Learning).
+Esta plataforma de software está diseñada para centralizar el monitoreo agrícola: recibe, procesa y analiza los datos de los sensores en campo para presentarlos de forma clara e interactiva. Este repositorio consolida el trabajo del Equipo B, enfocado en la construcción del backend, la interfaz de usuario y el sistema de detección de anomalías basado en Machine Learning (Isolation Forest).
 
-El sistema abandona el uso de WebSockets en favor de un flujo más robusto y estandarizado utilizando MQTT para telemetría en tiempo real y una API REST (FastAPI) para la integración y consulta de datos.
+Para garantizar una transmisión fluida, utilizamos MQTT para la telemetría de los sensores y HTTP para el envío de imágenes. Además, nos integramos con una API REST en FastAPI (desarrollada por el Equipo A y desplegada en PythonAnywhere). Esta API actúa como el puente principal del sistema, conectando la información procesada con nuestro dashboard para que el usuario pueda visualizar el estado de sus cultivos mediante gráficas y alertas en tiempo real.
+
+Entorno de Simulación y Pruebas
+Ante los retos logísticos con el hardware físico, garantizamos la solidez del software construyendo un entorno de pruebas simulado. Mediante scripts de generación de datos, entornos virtuales y ejecución por terminal, logramos emular el comportamiento completo de los nodos en campo. Esto nos permitió someter a estrés la comunicación, validar la API y comprobar todas las funcionalidades de la interfaz de usuario con éxito, dejando la plataforma lista para su futura integración física.
 
 ## Rol y Responsabilidades del Equipo B
 
 El desarrollo de este módulo cumple con el cronograma de tareas asignadas al equipo:
 
-*   **Revisión inicial:** Revisión de software y hardware del sistema desarrollado previamente.
+*   **Revisión inicial:** Revisión de software y hardware del sistema desarrollado previamente esto con el fin de comprender lo realizado en el semestre pasado para así tener una base del sistema y demas.
 *   **Almacenamiento y Comunicación:** Almacenamiento de datos mediante SQLite y evolución de la comunicación (reemplazando WebSockets por MQTT/HTTP).
 *   **Gestión de API:** Lectura y escritura API desde la Raspberry Pi.
 *   **Gestión de Alertas y Configuración:** Generación de alertas automatizadas y configuración del sistema por interfaz (FastAPI + Flet).
@@ -38,3 +41,8 @@ El flujo de información conecta los dispositivos de campo con el usuario final 
 *   **Comunicación:** Paho MQTT (Telemetría), Requests (Sincronización REST)
 *   **Machine Learning:** Scikit-learn (Isolation Forest), Numpy, Joblib
 *   **Base de Datos:** SQLite3
+
+## Equipo de trabajo: El  Equipo B esta conformado por las siguientes personas.
+ * Juan Jose Devia Espinosa
+ * Oscar Mauricio Cabezas Riascos
+ * Diego Alejandro Vallejo Rojas
