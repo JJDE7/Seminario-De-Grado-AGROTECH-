@@ -1,9 +1,9 @@
 """
 AgroTech Dashboard — Compatible con Flet 0.84+
-v3.1 — Cambios principales:
+v3.2 — Cambios principales:
 - Suscripción simultánea a todos los nodos desde el inicio
 - Navegación por ventanas sin scroll táctil
-- Horarios personalizables
+- Horarios personalizables (hora y minuto)
 - Historial paginado (10 registros por página)
 - NUEVO: Recepción de fotografías por HTTP (reemplaza MQTT+Base64).
   MQTT se conserva para sensores, status y configuración de horario.
@@ -101,26 +101,61 @@ def cargar_ultimo_dato(nodo_id):
         return historial[-1]
     return None
 
-def guardar_config_nodo(nodo_id, horas_list):
-    """Guarda la configuración de horarios de un nodo."""
+def _normalizar_horario(valor):
+    """Convierte un horario antiguo (ej. 10) o nuevo (ej. '10:33') a HH:MM."""
     try:
+        if isinstance(valor, str) and ":" in valor:
+            h, m = valor.split(":", 1)
+            h, m = int(h), int(m)
+        else:
+            h, m = int(valor), 0
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return f"{h:02d}:{m:02d}"
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _normalizar_horarios(valores):
+    """Normaliza una lista de horarios y elimina entradas inválidas."""
+    resultado = []
+    for valor in valores or []:
+        horario = _normalizar_horario(valor)
+        if horario is not None:
+            resultado.append(horario)
+    return resultado
+
+
+def _minutos_desde_medianoche(horario):
+    """Convierte HH:MM a minutos desde medianoche para ordenar."""
+    h, m = map(int, horario.split(":"))
+    return h * 60 + m
+
+
+def guardar_config_nodo(nodo_id, horarios_list):
+    """Guarda la configuración de horarios con precisión de minuto."""
+    try:
+        horarios = _normalizar_horarios(horarios_list)
         with open(ruta_config(nodo_id), "w") as f:
             json.dump({
-                "horas": horas_list,
+                "horas": horarios,
                 "actualizado": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }, f)
     except Exception as e:
         print(f"[CONFIG] Error guardando: {e}")
 
+
 def cargar_config_nodo(nodo_id):
-    """Carga la configuración guardada de un nodo."""
+    """Carga la configuración guardada y migra automáticamente horarios antiguos HH:00."""
     try:
         if os.path.exists(ruta_config(nodo_id)):
             with open(ruta_config(nodo_id), "r") as f:
-                return json.load(f)
+                cfg = json.load(f)
+            cfg["horas"] = _normalizar_horarios(cfg.get("horas", [10, 18]))
+            return cfg
     except Exception:
         pass
-    return {"horas": [10, 18], "actualizado": "—"}
+    return {"horas": ["10:00", "18:00"], "actualizado": "—"}
 
 # ══════════════════════════════════════════════════════════════════════
 #  HELPERS DE FORMATO (nivel módulo, usados en init y en MQTT)
@@ -904,35 +939,104 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
 def build_config(nodo, page, on_volver):
     nodo_id = nodo["id"]
     cfg = cargar_config_nodo(nodo_id)
-    horas_guardadas = cfg.get("horas", [10, 18])
-    modo = {"v": "2"}
-    num_custom = {"v": 4}
-    horas_seleccionadas = {
-        "2": horas_guardadas[:2] if len(horas_guardadas) >= 2 else [10, 18],
-        "3": horas_guardadas[:3] if len(horas_guardadas) >= 3 else [6, 12, 18],
-        "N": list(horas_guardadas) if len(horas_guardadas) >= 4 else [6, 8, 10, 12, 14, 16, 18, 20, 6, 8, 10, 12],
-    }
-    if len(horas_guardadas) == 3:
-        modo["v"] = "3"
-    elif len(horas_guardadas) > 3:
-        modo["v"] = "N"
-        num_custom["v"] = len(horas_guardadas)
+    horarios_guardados = _normalizar_horarios(cfg.get("horas", ["10:00", "18:00"]))
 
-    snack = ft.SnackBar(content=ft.Text(""), open=False)
-    page.overlay.append(snack)
+    # Modos rápidos de 2 y 3 medidas + modo personalizado.
+    # En personalizado ya no existe un límite arbitrario de 12 medidas.
+    # El límite físico es 1440 medidas si cada una debe ocupar un minuto único.
+    modo = {"v": "2"}
+    num_custom = {"v": max(4, len(horarios_guardados))}
+    horarios_seleccionados = {
+        "2": horarios_guardados[:2] if len(horarios_guardados) >= 2 else ["10:00", "18:00"],
+        "3": horarios_guardados[:3] if len(horarios_guardados) >= 3 else ["06:00", "12:00", "18:00"],
+        "N": list(horarios_guardados) if len(horarios_guardados) >= 4 else [
+            "06:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"
+        ],
+    }
+
+    if len(horarios_guardados) == 3:
+        modo["v"] = "3"
+    elif len(horarios_guardados) > 3:
+        modo["v"] = "N"
+        num_custom["v"] = len(horarios_guardados)
 
     estado_txt = ft.Text(
-        f'Horario activo: {len(horas_guardadas)} medidas/dia  -  Ultima actualizacion: {cfg.get("actualizado", "--")}',
+        f'Horario activo: {len(horarios_guardados)} medidas/dia  -  '
+        f'Ultima actualizacion: {cfg.get("actualizado", "--")}',
         size=9, color=C["gris_texto"], italic=True)
 
     btn_2med = ft.Container(border_radius=8, padding=ft.Padding.all(8))
     btn_3med = ft.Container(border_radius=8, padding=ft.Padding.all(8))
     btn_nmed = ft.Container(border_radius=8, padding=ft.Padding.all(8))
-    dropdowns_container = ft.Row(wrap=True, spacing=8, run_spacing=8)
-    num_display = ft.Text(str(num_custom["v"]), size=15, weight=ft.FontWeight.BOLD, color=C["verde"])
 
-    # Referencias directas a los dropdowns activos para leer .value al enviar
+    dropdowns_container = ft.Row(wrap=True, spacing=8, run_spacing=8)
+    # Con muchas medidas, la lista puede crecer verticalmente.
+    horarios_scroll = ft.Column(
+        [dropdowns_container],
+        scroll=ft.ScrollMode.AUTO,
+        expand=True,
+        spacing=0,
+    )
+
+    num_display = ft.Text(
+        str(num_custom["v"]), size=15,
+        weight=ft.FontWeight.BOLD, color=C["verde"])
+
+    # Cada entrada contiene dropdown de hora, dropdown de minuto,
+    # contenedor visual y mensaje de error.
     refs_activos = []
+    btn_enviar = None
+    estado_error = None
+
+    def validar_horarios():
+        """
+        Valida duplicados en tiempo real.
+        Si una medida posterior intenta usar exactamente el mismo HH:MM,
+        se marca en rojo y el botón Aplicar queda bloqueado.
+        """
+        usados = {}
+        hay_error = False
+
+        for i, ref in enumerate(refs_activos):
+            h = ref["hora"].value
+            m = ref["minuto"].value
+            horario = None
+
+            if h is not None and m is not None:
+                horario = f"{int(h):02d}:{int(m):02d}"
+
+            duplicado = horario is not None and horario in usados
+
+            ref["container"].border = ft.Border.all(
+                1.5 if duplicado else 1,
+                C["rojo"] if duplicado else C["gris_borde"])
+
+            ref["error"].value = (
+                f"Horario repetido: {horario}" if duplicado else "")
+            ref["error"].visible = duplicado
+
+            if duplicado:
+                hay_error = True
+            elif horario is not None:
+                usados[horario] = i
+
+        if btn_enviar is not None:
+            btn_enviar.disabled = hay_error or len(refs_activos) == 0
+
+        return not hay_error
+
+    def on_horario_change(e):
+        validar_horarios()
+        page.update()
+
+    def siguiente_horario_libre(horarios):
+        """Busca el primer HH:MM libre para una nueva medida."""
+        usados = set(_normalizar_horarios(horarios))
+        for minuto_total in range(24 * 60):
+            candidato = f"{minuto_total // 60:02d}:{minuto_total % 60:02d}"
+            if candidato not in usados:
+                return candidato
+        return "23:59"
 
     def decrementar(e):
         if num_custom["v"] > 4:
@@ -942,164 +1046,372 @@ def build_config(nodo, page, on_volver):
             page.update()
 
     def incrementar(e):
-        if num_custom["v"] < 12:
-            num_custom["v"] += 1
-            num_display.value = str(num_custom["v"])
-            actualizar_dropdowns_custom()
+        # Sin límite arbitrario de 12; 1440 es el máximo matemático de
+        # horarios únicos posibles en un día con resolución de un minuto.
+        if num_custom["v"] >= 24 * 60:
+            if estado_error is not None:
+                estado_error.value = (
+                    "No se pueden agregar más medidas: los 1440 minutos "
+                    "del día ya están ocupados.")
+                estado_error.visible = True
             page.update()
+            return
+
+        num_custom["v"] += 1
+        num_display.value = str(num_custom["v"])
+        actualizar_dropdowns_custom()
+        page.update()
 
     selector_cantidad = ft.Row([
-        ft.IconButton(ft.Icons.REMOVE_CIRCLE_OUTLINE, icon_color=C["verde"], on_click=decrementar, icon_size=18),
-        ft.Container(width=44, height=32, border_radius=8, bgcolor=C["verde_suave"],
-            border=ft.Border.all(1, C["verde_borde"]), alignment=ft.Alignment(0, 0), content=num_display),
-        ft.IconButton(ft.Icons.ADD_CIRCLE_OUTLINE, icon_color=C["verde"], on_click=incrementar, icon_size=18),
-        ft.Text("medidas/dia (max 12)", size=10, color=C["gris_texto"]),
+        ft.IconButton(
+            ft.Icons.REMOVE_CIRCLE_OUTLINE,
+            icon_color=C["verde"],
+            on_click=decrementar,
+            icon_size=18),
+        ft.Container(
+            width=44, height=32, border_radius=8,
+            bgcolor=C["verde_suave"],
+            border=ft.Border.all(1, C["verde_borde"]),
+            alignment=ft.Alignment(0, 0),
+            content=num_display),
+        ft.IconButton(
+            ft.Icons.ADD_CIRCLE_OUTLINE,
+            icon_color=C["verde"],
+            on_click=incrementar,
+            icon_size=18),
+        ft.Text(
+            "medidas/dia (Personalizado)",
+            size=10, color=C["gris_texto"]),
     ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
-    contenedor_custom = ft.Column([ft.Container(height=2), selector_cantidad], spacing=4, visible=False)
+    contenedor_custom = ft.Column(
+        [ft.Container(height=2), selector_cantidad],
+        spacing=4,
+        visible=True)
 
-    def hacer_dropdown(hora_val, idx_label):
-        dd = ft.Dropdown(
-            width=82, value=str(hora_val),
+    def hacer_dropdown(horario_val, idx_label):
+        horario_val = _normalizar_horario(horario_val) or "12:00"
+        hora_val, minuto_val = map(int, horario_val.split(":"))
+
+        dd_hora = ft.Dropdown(
+            width=68,
+            value=str(hora_val),
             options=[ft.dropdown.Option(str(h)) for h in range(24)],
-            label=f"H{idx_label}", text_size=11,
-            dense=True, content_padding=ft.Padding.symmetric(horizontal=6, vertical=2))
-        refs_activos.append(dd)
-        return ft.Container(
-            width=108,
+            label=f"H{idx_label}",
+            text_size=11,
+            dense=True,
+            content_padding=ft.Padding.symmetric(horizontal=5, vertical=2))
+
+        dd_minuto = ft.Dropdown(
+            width=68,
+            value=str(minuto_val),
+            options=[ft.dropdown.Option(f"{m:02d}") for m in range(60)],
+            label="Min",
+            text_size=11,
+            dense=True,
+            content_padding=ft.Padding.symmetric(horizontal=5, vertical=2))
+
+        # Compatibilidad con versiones de Flet donde on_change no es
+        # argumento del constructor.
+        dd_hora.on_change = on_horario_change
+        dd_minuto.on_change = on_horario_change
+
+        error = ft.Text(
+            "", size=8, color=C["rojo"],
+            visible=False, text_align=ft.TextAlign.CENTER)
+
+        item = ft.Container(
+            width=150,
+            padding=ft.Padding.symmetric(horizontal=5, vertical=4),
+            border_radius=8,
+            border=ft.Border.all(1, C["gris_borde"]),
+            bgcolor=C["blanco"],
             content=ft.Column([
-                ft.Text(f"M{idx_label}", size=8, color=C["gris_texto"], weight=ft.FontWeight.W_600),
-                ft.Row([dd, ft.Text(":00", size=8, color=C["gris_texto"])], spacing=1, tight=True),
-            ], spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True)
+                ft.Text(
+                    f"M{idx_label}", size=8,
+                    color=C["gris_texto"],
+                    weight=ft.FontWeight.W_600),
+                ft.Row(
+                    [dd_hora, dd_minuto],
+                    spacing=3,
+                    tight=True,
+                    alignment=ft.MainAxisAlignment.CENTER),
+                error,
+            ], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
         )
+
+        refs_activos.append({
+            "hora": dd_hora,
+            "minuto": dd_minuto,
+            "container": item,
+            "error": error,
+        })
+        return item
 
     def actualizar_dropdowns_custom():
         refs_activos.clear()
         n = num_custom["v"]
-        horas = horas_seleccionadas["N"]
-        while len(horas) < n:
-            horas.append(12)
-        dropdowns_container.controls = [hacer_dropdown(horas[i], i + 1) for i in range(n)]
-        page.update()
+        horarios = horarios_seleccionados["N"]
+
+        while len(horarios) < n:
+            horarios.append(siguiente_horario_libre(horarios))
+
+        dropdowns_container.controls = [
+            hacer_dropdown(horarios[i], i + 1) for i in range(n)
+        ]
+        validar_horarios()
 
     def actualizar_modo_ui():
         refs_activos.clear()
-        for b, m in [(btn_2med, "2"), (btn_3med, "3"), (btn_nmed, "N")]:
+
+        for b, m in [
+            (btn_2med, "2"),
+            (btn_3med, "3"),
+            (btn_nmed, "N")
+        ]:
             if modo["v"] == m:
                 b.bgcolor = C["verde_suave"]
                 b.border = ft.Border.all(2, C["verde"])
             else:
                 b.bgcolor = C["blanco"]
                 b.border = ft.Border.all(1, C["gris_borde"])
-        contenedor_custom.visible = (modo["v"] == "N")
+
+        contenedor_custom.visible = True
+
+        # +/- solamente modifican la cantidad en modo Personalizado.
+        selector_cantidad.visible = (modo["v"] == "N")
+
         if modo["v"] == "N":
             actualizar_dropdowns_custom()
         else:
             n = int(modo["v"])
-            horas = horas_seleccionadas[modo["v"]]
-            dropdowns_container.controls = [hacer_dropdown(horas[i], i + 1) for i in range(n)]
+            horarios = horarios_seleccionados[modo["v"]]
+            dropdowns_container.controls = [
+                hacer_dropdown(horarios[i], i + 1) for i in range(n)
+            ]
+            validar_horarios()
+
         page.update()
 
     def cambiar_modo(nuevo_modo):
         modo["v"] = nuevo_modo
+        if estado_error is not None:
+            estado_error.visible = False
         actualizar_modo_ui()
 
     btn_2med.content = ft.Column([
-        ft.Text("2 Medidas", size=11, weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
-        ft.Text("Ej: 10:00 y 18:00", size=9, color=C["gris_texto"]),
+        ft.Text(
+            "2 Medidas", size=11,
+            weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
+        ft.Text(
+            "Ej: 10:33 y 18:05",
+            size=9, color=C["gris_texto"]),
     ], spacing=2)
     btn_2med.on_click = lambda e: cambiar_modo("2")
     btn_2med.ink = True
 
     btn_3med.content = ft.Column([
-        ft.Text("3 Medidas", size=11, weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
-        ft.Text("Ej: 6, 12, 18:00", size=9, color=C["gris_texto"]),
+        ft.Text(
+            "3 Medidas", size=11,
+            weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
+        ft.Text(
+            "Ej: 06:15, 12:30, 18:45",
+            size=9, color=C["gris_texto"]),
     ], spacing=2)
     btn_3med.on_click = lambda e: cambiar_modo("3")
     btn_3med.ink = True
 
     btn_nmed.content = ft.Column([
-        ft.Text("Personalizado", size=11, weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
-        ft.Text("4 a 12 medidas", size=9, color=C["gris_texto"]),
+        ft.Text(
+            "Personalizado", size=11,
+            weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
+        ft.Text(
+            "4 o más medidas",
+            size=9, color=C["gris_texto"]),
     ], spacing=2)
     btn_nmed.on_click = lambda e: cambiar_modo("N")
     btn_nmed.ink = True
 
-    actualizar_modo_ui()
+    resultado = ft.Container(
+        visible=False,
+        border_radius=10,
+        padding=ft.Padding.all(10))
 
-    resultado = ft.Container(visible=False, border_radius=10, padding=ft.Padding.all(10))
+    estado_error = ft.Text(
+        "",
+        size=9,
+        color=C["rojo"],
+        weight=ft.FontWeight.W_600,
+        visible=False)
 
     def enviar(e):
-        horas = sorted([int(dd.value) for dd in refs_activos])
-        payload = json.dumps({"horas": horas})
+        if not validar_horarios():
+            estado_error.value = (
+                "No se puede aplicar: hay dos o más medidas con el mismo horario."
+            )
+            estado_error.visible = True
+            resultado.visible = False
+            page.update()
+            return
+
+        horarios = []
+        for ref in refs_activos:
+            h = int(ref["hora"].value)
+            m = int(ref["minuto"].value)
+            horarios.append(f"{h:02d}:{m:02d}")
+
+        # Orden cronológico.
+        horarios = sorted(horarios, key=_minutos_desde_medianoche)
+
+        # Payload compacto:
+        # "horas" mantiene la clave anterior y "minutos" aporta la
+        # precisión nueva. No hace falta enviar "horarios" porque el
+        # ESP32 puede reconstruir HH:MM a partir de ambas listas.
+        horas_payload = [int(h.split(":")[0]) for h in horarios]
+        minutos_payload = [int(h.split(":")[1]) for h in horarios]
+        payload = json.dumps({
+            "horas": horas_payload,
+            "minutos": minutos_payload,
+        })
+
         ok = mqtt_publicar_config(payload)
         if ok:
-            guardar_config_nodo(nodo_id, horas)
+            guardar_config_nodo(nodo_id, horarios)
+
             resultado.bgcolor = C["verde_suave"]
             resultado.border = ft.Border.all(1.5, C["verde_borde"])
             resultado.content = ft.Row([
-                ft.Icon(ft.Icons.CHECK_CIRCLE, color=C["verde"], size=16),
+                ft.Icon(
+                    ft.Icons.CHECK_CIRCLE,
+                    color=C["verde"],
+                    size=16),
                 ft.Column([
-                    ft.Text("Configuracion enviada!", size=11, weight=ft.FontWeight.BOLD, color=C["verde"]),
-                    ft.Text(f'esp32/config: {payload}', size=8, color=C["gris_texto"]),
-                    ft.Text(f'Horarios: {", ".join([f"{h}:00" for h in horas])}', size=9, color=C["negro_texto"]),
+                    ft.Text(
+                        "Configuracion enviada!",
+                        size=11,
+                        weight=ft.FontWeight.BOLD,
+                        color=C["verde"]),
+                    ft.Text(
+                        f'esp32/config: {payload}',
+                        size=8,
+                        color=C["gris_texto"]),
+                    ft.Text(
+                        f'Horarios: {", ".join(horarios)}',
+                        size=9,
+                        color=C["negro_texto"]),
                 ], spacing=1),
             ], spacing=8)
-            estado_txt.value = (f'Horario activo: {len(horas)} medidas/dia  -  '
-                                f'Ultima actualizacion: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
+
+            estado_txt.value = (
+                f'Horario activo: {len(horarios)} medidas/dia  -  '
+                f'Ultima actualizacion: '
+                f'{datetime.now().strftime("%Y-%m-%d %H:%M")}')
+            estado_error.visible = False
         else:
             resultado.bgcolor = "#FFEBEE"
             resultado.border = ft.Border.all(1.5, C["rojo"])
             resultado.content = ft.Row([
                 ft.Icon(ft.Icons.ERROR, color=C["rojo"], size=16),
                 ft.Column([
-                    ft.Text("Error al enviar", size=11, weight=ft.FontWeight.BOLD, color=C["rojo"]),
-                    ft.Text("Verifica que el broker MQTT esta activo.", size=9, color=C["gris_texto"]),
+                    ft.Text(
+                        "Error al enviar",
+                        size=11,
+                        weight=ft.FontWeight.BOLD,
+                        color=C["rojo"]),
+                    ft.Text(
+                        "Verifica que el broker MQTT esta activo.",
+                        size=9,
+                        color=C["gris_texto"]),
                 ], spacing=1),
             ], spacing=8)
+
         resultado.visible = True
         page.update()
 
     btn_enviar = ft.FilledButton(
         content=ft.Row([
-            ft.Icon(ft.Icons.SEND, size=14, color=ft.Colors.WHITE),
-            ft.Text("Aplicar\nConfiguracion", size=11, weight=ft.FontWeight.BOLD,
-                    color=ft.Colors.WHITE, text_align=ft.TextAlign.CENTER),
+            ft.Icon(
+                ft.Icons.SEND,
+                size=14,
+                color=ft.Colors.WHITE),
+            ft.Text(
+                "Aplicar\nConfiguracion",
+                size=11,
+                weight=ft.FontWeight.BOLD,
+                color=ft.Colors.WHITE,
+                text_align=ft.TextAlign.CENTER),
         ], spacing=6, alignment=ft.MainAxisAlignment.CENTER),
-        style=ft.ButtonStyle(bgcolor=C["verde"],
+        style=ft.ButtonStyle(
+            bgcolor=C["verde"],
             shape=ft.RoundedRectangleBorder(radius=8),
             padding=ft.Padding.symmetric(horizontal=14, vertical=12)),
-        on_click=enviar, width=160)
+        on_click=enviar,
+        width=160)
+
+    # Revalidar después de crear el botón.
+    validar_horarios()
 
     return ft.Column([
-        barra_superior(f'Configuracion - {nodo["nombre"]}', on_back=lambda e: on_volver()),
-        ft.Container(expand=True, bgcolor=C["fondo"],
+        barra_superior(
+            f'Configuracion - {nodo["nombre"]}',
+            on_back=lambda e: on_volver()),
+        ft.Container(
+            expand=True,
+            bgcolor=C["fondo"],
             padding=ft.Padding.symmetric(horizontal=10, vertical=8),
             content=ft.Column([
                 ft.Row([
-                    ft.Container(width=34, height=34, border_radius=10,
-                        bgcolor=ft.Colors.with_opacity(0.15, C["azul"]),
-                        content=ft.Icon(ft.Icons.SETTINGS, color=C["azul"], size=18),
+                    ft.Container(
+                        width=34, height=34, border_radius=10,
+                        bgcolor=ft.Colors.with_opacity(
+                            0.15, C["azul"]),
+                        content=ft.Icon(
+                            ft.Icons.SETTINGS,
+                            color=C["azul"],
+                            size=18),
                         alignment=ft.Alignment(0, 0)),
                     ft.Column([
-                        ft.Text("Horario de Mediciones", size=14, weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
-                        ft.Text("Personaliza las horas de medicion.", size=10, color=C["gris_texto"]),
+                        ft.Text(
+                            "Horario de Mediciones",
+                            size=14,
+                            weight=ft.FontWeight.BOLD,
+                            color=C["negro_texto"]),
+                        ft.Text(
+                            "Selecciona hora y minuto para cada medicion.",
+                            size=10,
+                            color=C["gris_texto"]),
                     ], spacing=1),
                 ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Divider(color=C["gris_borde"], height=1),
                 estado_txt,
                 ft.Container(height=2),
-                ft.Text("Selecciona cantidad de medidas:", size=11, weight=ft.FontWeight.W_600, color=C["negro_texto"]),
-                ft.Row([btn_2med, btn_3med, btn_nmed, ft.Container(expand=True), btn_enviar], spacing=8),
+                ft.Text(
+                    "Selecciona cantidad de medidas:",
+                    size=11,
+                    weight=ft.FontWeight.W_600,
+                    color=C["negro_texto"]),
+                ft.Row([
+                    btn_2med,
+                    btn_3med,
+                    btn_nmed,
+                    ft.Container(expand=True),
+                    btn_enviar
+                ], spacing=8),
                 contenedor_custom,
-                ft.Container(height=4),
-                ft.Text("Configura los horarios:", size=11, weight=ft.FontWeight.W_600, color=C["negro_texto"]),
+                estado_error,
                 ft.Container(height=2),
-                dropdowns_container,
+                ft.Text(
+                    "Configura los horarios:",
+                    size=11,
+                    weight=ft.FontWeight.W_600,
+                    color=C["negro_texto"]),
+                ft.Container(height=2),
+                horarios_scroll,
                 ft.Container(height=4),
                 resultado,
             ], spacing=6, expand=True)),
     ], spacing=0, expand=True)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  PANTALLA 5 — HISTORIAL PAGINADO
