@@ -1697,6 +1697,14 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                     txt_c.value  = f"Última foto: {hora_img}" if hora_img else "Foto recibida"
                     txt_c.italic = False
 
+        # --- CAMBIO AÑADIDO: Actualización al vuelo de alertas ML ---
+        try:
+            if vista_actual.get("v") == 3:
+                vistas[3].content.controls[2] = construir_vista_alertas()
+        except (NameError, KeyError, IndexError):
+            pass # Previene errores en la llamada inicial cuando las vistas aún no existen
+        # ------------------------------------------------------------
+
         try:
             page.update()
         except Exception as e:
