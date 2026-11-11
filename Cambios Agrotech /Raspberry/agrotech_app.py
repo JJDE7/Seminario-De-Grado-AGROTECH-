@@ -86,8 +86,103 @@ CLOUD_SYNC_INTERVAL = 30
 # en esp32/<nodo_id>/config con retain=True.
 CONFIG_CLOUD_SYNC_INTERVAL = 30
 
-DATA_DIR    = os.path.expanduser("~/agrotech/data")
+AGROTECH_DIR = os.path.expanduser("~/agrotech")
+DATA_DIR    = os.path.join(AGROTECH_DIR, "data")
+STORAGE_CONFIG_FILE = os.path.join(AGROTECH_DIR, "storage_config.json")
+DEFAULT_MAX_STORAGE_MB = 512
+DEFAULT_DELETE_COUNT = 100
 os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def cargar_config_almacenamiento():
+    cfg = {"max_mb": DEFAULT_MAX_STORAGE_MB, "eliminar_cantidad": DEFAULT_DELETE_COUNT}
+    try:
+        with open(STORAGE_CONFIG_FILE, "r", encoding="utf-8") as f:
+            guardada = json.load(f)
+        cfg["max_mb"] = max(100, int(guardada.get("max_mb", cfg["max_mb"])))
+        cfg["eliminar_cantidad"] = max(1, int(guardada.get("eliminar_cantidad", cfg["eliminar_cantidad"])))
+    except Exception:
+        pass
+    return cfg
+
+
+def guardar_config_almacenamiento(max_mb, eliminar_cantidad):
+    cfg = {"max_mb": max(100, int(max_mb)), "eliminar_cantidad": max(1, int(eliminar_cantidad))}
+    os.makedirs(AGROTECH_DIR, exist_ok=True)
+    tmp = STORAGE_CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, STORAGE_CONFIG_FILE)
+    return cfg
+
+
+def _tamano_directorio(ruta):
+    total = 0
+    for raiz, _, archivos in os.walk(ruta):
+        for nombre in archivos:
+            try: total += os.path.getsize(os.path.join(raiz, nombre))
+            except OSError: pass
+    return total
+
+
+def estado_almacenamiento():
+    cfg = cargar_config_almacenamiento()
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        datos = conn.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)),0) FROM mediciones").fetchone()
+        fotos = conn.execute("SELECT COUNT(*), COALESCE(SUM(tam_bytes),0) FROM fotos").fetchone()
+    return {"carpeta": AGROTECH_DIR, "total_bytes": _tamano_directorio(AGROTECH_DIR),
+            "datos_cantidad": datos[0], "datos_payload_bytes": datos[1],
+            "fotos_cantidad": fotos[0], "fotos_bytes": fotos[1],
+            "max_mb": cfg["max_mb"], "eliminar_cantidad": cfg["eliminar_cantidad"]}
+
+
+def aplicar_limpieza_almacenamiento():
+    """Si ~/agrotech excede el límite, elimina lotes antiguos de datos y fotos."""
+    try:
+        cfg = cargar_config_almacenamiento()
+        limite = cfg["max_mb"] * 1024 * 1024
+        if _tamano_directorio(AGROTECH_DIR) <= limite:
+            return
+        cantidad = cfg["eliminar_cantidad"]
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            # Se eliminan mediciones más antiguas y sus entradas del historial JSON.
+            antiguas = conn.execute("SELECT id,nodo_id,timestamp FROM mediciones ORDER BY id ASC LIMIT ?", (cantidad,)).fetchall()
+            ids = [r[0] for r in antiguas]
+            por_nodo = {}
+            for _, nid, ts in antiguas: por_nodo.setdefault(nid, set()).add(ts)
+            fotos_asociadas = []
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                fotos_asociadas = conn.execute(
+                    f"SELECT id,ruta FROM fotos WHERE medicion_id IN ({placeholders})", ids
+                ).fetchall()
+                conn.executemany("DELETE FROM mediciones WHERE id=?", [(i,) for i in ids])
+                for fid, ruta in fotos_asociadas:
+                    try:
+                        if os.path.isfile(ruta): os.remove(ruta)
+                    except OSError as e: print(f"[LIMPIEZA] No se pudo borrar foto asociada {ruta}: {e}")
+                    conn.execute("DELETE FROM fotos WHERE id=?", (fid,))
+            # Se purgan fotos antiguas adicionales si aún se necesita liberar espacio.
+            fotos_antiguas = conn.execute("SELECT id,ruta FROM fotos ORDER BY id ASC LIMIT ?", (cantidad,)).fetchall()
+            for fid, ruta in fotos_antiguas:
+                try:
+                    if os.path.isfile(ruta): os.remove(ruta)
+                except OSError as e: print(f"[LIMPIEZA] No se pudo borrar {ruta}: {e}")
+                conn.execute("DELETE FROM fotos WHERE id=?", (fid,))
+            conn.commit()
+        for nid, timestamps in por_nodo.items():
+            historial = cargar_historial(nid)
+            historial = [r for r in historial if r.get("timestamp") not in timestamps]
+            try:
+                with open(ruta_historial(nid), "w", encoding="utf-8") as f: json.dump(historial, f, indent=2)
+            except Exception as e: print(f"[LIMPIEZA] Error actualizando historial {nid}: {e}")
+        # Vaciar páginas libres de SQLite después de eliminar filas.
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+        print(f"[LIMPIEZA] Se purgaron {len(ids)} mediciones, {len(fotos_asociadas)} fotos asociadas y {len(fotos_antiguas)} fotos adicionales.")
+    except Exception as e:
+        print(f"[LIMPIEZA] Error aplicando límite de almacenamiento: {e}")
 
 NODOS = [
     {"id":"nodo1","nombre":"Nodo 1 · Parcela A","topic":"esp32/nodo1/data","camera_ip":"10.0.0.60","activo":True},
@@ -113,131 +208,65 @@ C = {
 #  SQLITE — ALMACENAMIENTO HISTÓRICO
 # ══════════════════════════════════════════════════════════════════════
 def sqlite_iniciar():
-    """Crea la base de datos y la tabla de mediciones si no existen."""
+    """Inicializa SQLite; las fotos se guardan como archivos y solo se registra su ruta."""
     try:
         os.makedirs(os.path.dirname(SQLITE_DB), exist_ok=True)
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS mediciones (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nodo_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    temperatura REAL,
-                    humedad REAL,
-                    nitrogeno REAL,
-                    fosforo REAL,
-                    potasio REAL,
-                    humedad_suelo REAL,
-                    temperatura_suelo REAL,
-                    conductividad REAL,
-                    ph REAL,
-                    bateria REAL,
-                    payload TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_mediciones_nodo_fecha
-                ON mediciones(nodo_id, timestamp)
-            """)
-            # Historial completo de fotografías.
-            # Las versiones antiguas usaban nodo_id como PRIMARY KEY y
-            # solamente conservaban una foto por nodo. La migración de
-            # abajo detecta esa estructura y conserva sus registros.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS fotos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nodo_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    imagen BLOB NOT NULL,
-                    tam_bytes INTEGER NOT NULL,
-                    enviado INTEGER NOT NULL DEFAULT 0,
-                    UNIQUE(nodo_id, timestamp)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS configuraciones (
-                    nodo_id TEXT PRIMARY KEY,
-                    horarios TEXT NOT NULL,
-                    actualizado TEXT NOT NULL
-                )
-            """)
-
-            # Control local de la sincronización de horarios con main.py.
-            # Permite asociar un configok del ESP32 con la versión exacta
-            # que la Raspberry publicó, incluso después de reiniciar.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS config_nube_sync (
-                    nodo_id TEXT PRIMARY KEY,
-                    version INTEGER NOT NULL DEFAULT 0,
-                    horarios TEXT NOT NULL DEFAULT '[]',
-                    publicada INTEGER NOT NULL DEFAULT 0,
-                    aplicada INTEGER NOT NULL DEFAULT 0,
-                    actualizado TEXT NOT NULL
-                )
-            """)
-
-            # 0 = pendiente, 1 = confirmado por el servidor.
-            # Se agrega de forma compatible a una base SQLite ya existente.
-            columnas_med = {row[1] for row in conn.execute(
-                "PRAGMA table_info(mediciones)").fetchall()}
-            if "enviado" not in columnas_med:
-                conn.execute(
-                    "ALTER TABLE mediciones ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
-                )
-
-            # -------------------------------------------------------------
-            # MIGRACIÓN DE FOTOS: versiones anteriores tenían nodo_id como
-            # PRIMARY KEY. Se crea una tabla histórica y se copian los datos.
-            # -------------------------------------------------------------
-            info_fotos = conn.execute("PRAGMA table_info(fotos)").fetchall()
-            nombres_foto = {row[1] for row in info_fotos}
-            pk_por_columna = {row[1]: row[5] for row in info_fotos}
-            estructura_antigua = (
-                "id" not in nombres_foto
-                or pk_por_columna.get("nodo_id") == 1
-            )
-
-            if estructura_antigua:
-                nombre_legacy = "fotos_legacy_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-                conn.execute(f'ALTER TABLE fotos RENAME TO "{nombre_legacy}"')
-                conn.execute("""
-                    CREATE TABLE fotos (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        nodo_id TEXT NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        imagen BLOB NOT NULL,
-                        tam_bytes INTEGER NOT NULL,
-                        enviado INTEGER NOT NULL DEFAULT 0,
-                        UNIQUE(nodo_id, timestamp)
-                    )
-                """)
-
-                columnas_legacy = {row[1] for row in conn.execute(
-                    f'PRAGMA table_info("{nombre_legacy}")').fetchall()}
-                if "enviado" in columnas_legacy:
-                    conn.execute(f"INSERT OR IGNORE INTO fotos (nodo_id, timestamp, imagen, tam_bytes, enviado) SELECT nodo_id, timestamp, imagen, tam_bytes, enviado FROM '{nombre_legacy}'")
-                else:
-                    conn.execute(f"INSERT OR IGNORE INTO fotos (nodo_id, timestamp, imagen, tam_bytes, enviado) SELECT nodo_id, timestamp, imagen, tam_bytes, 0 FROM '{nombre_legacy}'")
-
-                print(f"[SQLITE] Migrada tabla de fotos antigua a historial: {nombre_legacy}")
-
-            columnas_foto = {row[1] for row in conn.execute(
-                "PRAGMA table_info(fotos)").fetchall()}
-            if "enviado" not in columnas_foto:
-                conn.execute(
-                    "ALTER TABLE fotos ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
-                )
-
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_mediciones_enviado
-                ON mediciones(enviado, id)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_fotos_enviado
-                ON fotos(enviado, nodo_id)
-            """)
-
-            # Registra en SQLite las fotos que ya existen en disco.
+            conn.execute("""CREATE TABLE IF NOT EXISTS mediciones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, nodo_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL, temperatura REAL, humedad REAL,
+                nitrogeno REAL, fosforo REAL, potasio REAL, humedad_suelo REAL,
+                temperatura_suelo REAL, conductividad REAL, ph REAL, bateria REAL,
+                payload TEXT NOT NULL, enviado INTEGER NOT NULL DEFAULT 0)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mediciones_nodo_fecha ON mediciones(nodo_id, timestamp)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS configuraciones (
+                nodo_id TEXT PRIMARY KEY, horarios TEXT NOT NULL, actualizado TEXT NOT NULL,
+                origen TEXT NOT NULL DEFAULT 'Raspberry')""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS config_nube_sync (
+                nodo_id TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0,
+                horarios TEXT NOT NULL DEFAULT '[]', publicada INTEGER NOT NULL DEFAULT 0,
+                aplicada INTEGER NOT NULL DEFAULT 0, actualizado TEXT NOT NULL)""")
+            # Migrar fotos antiguas con BLOB a archivos JPEG antes de eliminar la columna BLOB.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(fotos)").fetchall()}
+            if cols and "ruta" not in cols:
+                legacy = "fotos_legacy_migracion"
+                conn.execute(f'ALTER TABLE fotos RENAME TO "{legacy}"')
+                conn.execute("""CREATE TABLE fotos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, nodo_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL, ruta TEXT NOT NULL, tam_bytes INTEGER NOT NULL,
+                    enviado INTEGER NOT NULL DEFAULT 0, medicion_id INTEGER,
+                    UNIQUE(nodo_id,timestamp))""")
+                oldcols = {r[1] for r in conn.execute(f'PRAGMA table_info("{legacy}")').fetchall()}
+                if {"nodo_id", "timestamp", "imagen"}.issubset(oldcols):
+                    extra = ", enviado" if "enviado" in oldcols else ""
+                    rows = conn.execute(f'SELECT nodo_id,timestamp,imagen{extra} FROM "{legacy}"').fetchall()
+                    for row in rows:
+                        nid, ts, blob = row[:3]
+                        if not blob: continue
+                        nombre = "cam_" + str(nid) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg"
+                        ruta = os.path.join(DATA_DIR, nombre)
+                        with open(ruta, "wb") as f: f.write(bytes(blob))
+                        enviado = int(row[3]) if len(row) > 3 else 0
+                        conn.execute("INSERT OR IGNORE INTO fotos(nodo_id,timestamp,ruta,tam_bytes,enviado) VALUES(?,?,?,?,?)",
+                                     (nid, ts, ruta, os.path.getsize(ruta), enviado))
+                conn.execute(f'DROP TABLE "{legacy}"')
+            else:
+                conn.execute("""CREATE TABLE IF NOT EXISTS fotos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, nodo_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL, ruta TEXT NOT NULL, tam_bytes INTEGER NOT NULL,
+                    enviado INTEGER NOT NULL DEFAULT 0, medicion_id INTEGER,
+                    UNIQUE(nodo_id,timestamp))""")
+            cols_fotos = {r[1] for r in conn.execute("PRAGMA table_info(fotos)").fetchall()}
+            if "medicion_id" not in cols_fotos:
+                conn.execute("ALTER TABLE fotos ADD COLUMN medicion_id INTEGER")
+            cols_med = {r[1] for r in conn.execute("PRAGMA table_info(mediciones)").fetchall()}
+            if "enviado" not in cols_med:
+                conn.execute("ALTER TABLE mediciones ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0")
+            cols_cfg = {r[1] for r in conn.execute("PRAGMA table_info(configuraciones)").fetchall()}
+            if "origen" not in cols_cfg:
+                conn.execute("ALTER TABLE configuraciones ADD COLUMN origen TEXT NOT NULL DEFAULT 'Raspberry'")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mediciones_enviado ON mediciones(enviado,id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_fotos_enviado ON fotos(enviado,nodo_id)")
             sqlite_importar_fotos_carpeta(conn)
             conn.commit()
         print(f"[SQLITE] Base de datos lista: {SQLITE_DB}")
@@ -248,59 +277,24 @@ def sqlite_iniciar():
 
 
 def sqlite_importar_fotos_carpeta(conn):
-    """Importa fotos históricas de DATA_DIR sin borrar ni mover archivos."""
+    """Registra rutas de imágenes ya presentes en DATA_DIR sin copiar sus bytes a SQLite."""
     import re
-
-    patron = re.compile(r"^cam_(nodo[^_]+)_(\d{8})_(\d{6})\.jpe?g$", re.IGNORECASE)
-    importadas = 0
-    ignoradas = 0
-
-    try:
-        nombres = os.listdir(DATA_DIR)
+    patron = re.compile(r"^cam_(nodo[^_]+)_(\d{8})_(\d{6})(?:_\d+)?\.jpe?g$", re.IGNORECASE)
+    try: nombres = os.listdir(DATA_DIR)
     except Exception as e:
-        print(f"[SQLITE] No se pudo revisar DATA_DIR para importar fotos: {e}")
+        print(f"[SQLITE] No se pudo revisar carpeta de fotos: {e}")
         return
-
     for nombre in sorted(nombres):
-        match = patron.match(nombre)
-        if not match:
-            continue
-
-        nodo_id, fecha, hora = match.groups()
-        try:
-            timestamp = datetime.strptime(
-                f"{fecha}_{hora}", "%Y%m%d_%H%M%S"
-            ).strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-
+        m = patron.match(nombre)
+        if not m: continue
+        nid, fecha, hora = m.groups()[:3]
+        try: ts = datetime.strptime(f"{fecha}_{hora}", "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError: continue
         ruta = os.path.join(DATA_DIR, nombre)
         try:
-            with open(ruta, "rb") as f:
-                imagen = f.read()
-        except Exception as e:
-            print(f"[SQLITE] No se pudo leer foto histórica {nombre}: {e}")
-            continue
-
-        if not imagen:
-            continue
-
-        cursor = conn.execute("""
-            INSERT INTO fotos
-                (nodo_id, timestamp, imagen, tam_bytes, enviado)
-            VALUES (?, ?, ?, ?, 0)
-            ON CONFLICT(nodo_id, timestamp) DO NOTHING
-        """, (nodo_id, timestamp, sqlite3.Binary(imagen), len(imagen)))
-
-        if cursor.rowcount:
-            importadas += 1
-        else:
-            ignoradas += 1
-
-    if importadas:
-        print(f"[SQLITE] Fotos históricas importadas desde carpeta: {importadas}")
-    if ignoradas:
-        print(f"[SQLITE] Fotos ya registradas/duplicadas ignoradas: {ignoradas}")
+            conn.execute("INSERT OR IGNORE INTO fotos(nodo_id,timestamp,ruta,tam_bytes,enviado) VALUES(?,?,?,?,0)",
+                         (nid, ts, ruta, os.path.getsize(ruta)))
+        except OSError: pass
 
 
 def _numero(valor):
@@ -440,12 +434,10 @@ def sqlite_marcar_medicion_enviada(id_medicion):
 def sqlite_fotos_pendientes(limite=100):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         return conn.execute("""
-            SELECT id, nodo_id, timestamp, imagen, tam_bytes
-            FROM fotos
-            WHERE enviado = 0
-            ORDER BY id ASC
-            LIMIT ?
+            SELECT id, nodo_id, timestamp, ruta, tam_bytes
+            FROM fotos WHERE enviado = 0 ORDER BY id ASC LIMIT ?
         """, (limite,)).fetchall()
+
 
 def sqlite_marcar_foto_enviada(id_foto):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
@@ -504,8 +496,10 @@ def sincronizar_con_nube():
             print(f"[SYNC] Error enviando medición {id_local}: {e}")
             break
 
-    for id_foto, nodo_id, timestamp, imagen, tam_bytes in sqlite_fotos_pendientes():
+    for id_foto, nodo_id, timestamp, ruta_foto, tam_bytes in sqlite_fotos_pendientes():
         try:
+            with open(ruta_foto, "rb") as archivo_foto:
+                imagen = archivo_foto.read()
             numero_nodo = nodo_id.replace("nodo", "", 1)
             respuesta = requests.post(
                 _cloud_url(f"/api/nodos/{numero_nodo}/foto"),
@@ -635,7 +629,7 @@ def _minutos_desde_medianoche(horario):
     return h * 60 + m
 
 
-def guardar_config_sqlite(nodo_id, horarios_list):
+def guardar_config_sqlite(nodo_id, horarios_list, origen="Raspberry (interfaz local)"):
     """Guarda la configuración de horarios en SQLite para la API REST."""
     horarios = _normalizar_horarios(horarios_list)
     horarios = sorted(set(horarios), key=_minutos_desde_medianoche)
@@ -643,12 +637,13 @@ def guardar_config_sqlite(nodo_id, horarios_list):
     try:
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
             conn.execute("""
-                INSERT INTO configuraciones (nodo_id, horarios, actualizado)
-                VALUES (?, ?, ?)
+                INSERT INTO configuraciones (nodo_id, horarios, actualizado, origen)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(nodo_id) DO UPDATE SET
                     horarios=excluded.horarios,
-                    actualizado=excluded.actualizado
-            """, (nodo_id, json.dumps(horarios), timestamp))
+                    actualizado=excluded.actualizado,
+                    origen=excluded.origen
+            """, (nodo_id, json.dumps(horarios), timestamp, origen))
             conn.commit()
         return True
     except Exception as e:
@@ -661,13 +656,13 @@ def sqlite_config(nodo_id):
     try:
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
             row = conn.execute("""
-                SELECT horarios, actualizado
+                SELECT horarios, actualizado, origen
                 FROM configuraciones
                 WHERE nodo_id = ?
             """, (nodo_id,)).fetchone()
         if row:
             horarios = _normalizar_horarios(json.loads(row[0]))
-            return {"horas": sorted(set(horarios), key=_minutos_desde_medianoche), "actualizado": row[1]}
+            return {"horas": sorted(set(horarios), key=_minutos_desde_medianoche), "actualizado": row[1], "origen": row[2] if len(row) > 2 else "Raspberry (configuración local)"}
     except Exception as e:
         print(f"[SQLITE] Error consultando configuración de {nodo_id}: {e}")
     return cargar_config_nodo(nodo_id)
@@ -761,11 +756,28 @@ for nodo in NODOS:
             "imagen_gen": 0,
         }
 
+# Recupera la última fotografía desde el archivo al iniciar, no desde SQLite.
+for _nodo in NODOS:
+    _nid = _nodo["id"]
+    try:
+        _candidatas = [os.path.join(DATA_DIR, n) for n in os.listdir(DATA_DIR)
+                       if n.startswith(f"cam_{_nid}_") and n.lower().endswith((".jpg", ".jpeg"))]
+        if _candidatas:
+            _ruta = max(_candidatas, key=os.path.getmtime)
+            with open(_ruta, "rb") as _f:
+                estado_nodos[_nid]["ultima_imagen_b64"] = base64.b64encode(_f.read()).decode("ascii")
+            estado_nodos[_nid]["ultima_imagen_ruta"] = _ruta
+            estado_nodos[_nid]["ultima_imagen_ts"] = datetime.fromtimestamp(os.path.getmtime(_ruta)).strftime("%H:%M:%S")
+            estado_nodos[_nid]["imagen_gen"] = 1
+    except Exception as _e:
+        print(f"[CAM] No se pudo precargar foto de {_nid}: {_e}")
+
 estado_mqtt = {"conectado": False}
 # v12: última confirmación recibida de cada nodo (tópico esp32/<id>/configok)
 # y último status ("hola", "chao", "config_on", "config_off").
 estado_config_ack = {}
 estado_status_nodo = {}
+estado_config_horarios = {}
 _mqtt_client: Optional[mqtt.Client] = None
 _camara_activa = threading.Event()
 
@@ -816,9 +828,15 @@ def mqtt_iniciar_global(on_update):
             # horario y el status de cada nodo activo.
             for nodo in NODOS:
                 if nodo["activo"]:
+                    client.subscribe(f'esp32/{nodo["id"]}/config')
                     client.subscribe(f'esp32/{nodo["id"]}/configok')
                     client.subscribe(f'esp32/{nodo["id"]}/status')
-                    print(f'[MQTT] Suscrito a esp32/{nodo["id"]}/configok y /status')
+                    print(f'[MQTT] Suscrito a esp32/{nodo["id"]}/config, /configok y /status')
+            # Leer también horarios retenidos de nodos actualmente desactivados en la UI.
+            for nodo in NODOS:
+                if not nodo["activo"]:
+                    client.subscribe(f'esp32/{nodo["id"]}/config')
+                    print(f'[MQTT] Suscrito a esp32/{nodo["id"]}/config (nodo inactivo)')
             # NOTA: ya NO nos suscribimos a cam/start, cam/data, cam/end.
             # Las fotos ahora llegan por HTTP (ver http_photo_server_iniciar()),
             # no por MQTT+Base64.
@@ -834,6 +852,25 @@ def mqtt_iniciar_global(on_update):
         """Procesa mensajes de datos de cualquier nodo (sensores/status)."""
         try:
             texto = msg.payload.decode("utf-8", errors="ignore")
+
+            # Horario retenido que el broker entrega al suscribirse.
+            if msg.topic.endswith("/config"):
+                nid = msg.topic.split("/")[1]
+                try:
+                    cfg_payload = json.loads(texto)
+                    horarios_topic = _horarios_desde_payload_config(cfg_payload)
+                    if horarios_topic:
+                        cfg_guardada = sqlite_config(nid)
+                        estado_config_horarios[nid] = {
+                            "horarios": sorted(set(horarios_topic), key=_minutos_desde_medianoche),
+                            "origen": cfg_payload.get("origen") or cfg_guardada.get("origen") or "Tópico MQTT retenido (origen no identificado)",
+                            "actualizado": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                        print(f"[MQTT] Horario retenido de {nid}: {horarios_topic}")
+                        notificar_actualizacion()
+                except Exception as e:
+                    print(f"[MQTT] Configuración retenida inválida en {msg.topic}: {e}")
+                return
 
             # ── v12: confirmación de horario enviada por el ESP32 ──
             if msg.topic.endswith("/configok"):
@@ -908,6 +945,7 @@ def mqtt_iniciar_global(on_update):
                 # 2) SQLite para historial completo y consultas externas
                 guardar_dato(nodo_id, registro)
                 id_medicion = guardar_sqlite(nodo_id, registro, timestamp_medicion)
+                aplicar_limpieza_almacenamiento()
                 if id_medicion is not None:
                     solicitar_sincronizacion()
 
@@ -1201,6 +1239,7 @@ def sincronizar_configuraciones_con_nube():
                 payload = json.dumps({
                     "horas": [int(h.split(":")[0]) for h in horarios],
                     "minutos": [int(h.split(":")[1]) for h in horarios],
+                    "origen": "Base de datos en la nube",
                 })
 
                 # Si main.py tiene una versión nueva, reemplazamos la anterior
@@ -1239,6 +1278,8 @@ def sincronizar_configuraciones_con_nube():
                     publicada=True,
                     aplicada=False,
                 )
+                guardar_config_nodo(nodo_id, horarios)
+                guardar_config_sqlite(nodo_id, horarios, "Base de datos en la nube")
 
                 # Sincroniza el RTC solo si el nodo está despierto; el mensaje
                 # NO es retenido y por tanto no puede reajustar el reloj con una
@@ -1384,93 +1425,41 @@ def _normalizar_nodo_id(nodo_param: str) -> str:
     return nodo_param  # no reconocido; se guarda igual pero se avisa en consola
 
 def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
-    """
-    Lógica única de persistencia y actualización de UI para una foto recibida.
-    Reemplaza lo que antes hacía cam_on_end() al decodificar Base64 desde MQTT;
-    ahora recibe directamente los bytes binarios del POST HTTP.
-    """
+    """Guarda la foto como archivo y almacena en SQLite únicamente su ruta."""
     try:
-        nombre  = f"cam_{nodo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        ahora = datetime.now()
+        timestamp_foto = ahora.strftime("%Y-%m-%d %H:%M:%S")
+        nombre = f"cam_{nodo_id}_{ahora.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
         ruta_jpg = os.path.join(DATA_DIR, nombre)
         with open(ruta_jpg, "wb") as f:
             f.write(img_bytes)
-        print(f"[CAM] JPEG guardado: {ruta_jpg}")
-
-        clean_b64 = base64.b64encode(img_bytes).decode("utf-8")
-        hora      = datetime.now().strftime("%H:%M:%S")
-        tam_kb    = len(img_bytes) // 1024
-        timestamp_foto = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # ── Persistir CADA foto en SQLite (historial completo) ──
-        try:
-            with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-                cursor = conn.execute("""
-                    INSERT INTO fotos
-                        (nodo_id, timestamp, imagen, tam_bytes, enviado)
-                    VALUES (?, ?, ?, ?, 0)
-                    ON CONFLICT(nodo_id, timestamp) DO NOTHING
-                """, (
-                    nodo_id,
-                    timestamp_foto,
-                    sqlite3.Binary(img_bytes),
-                    len(img_bytes),
-                ))
-                conn.commit()
-
-                if cursor.rowcount == 0:
-                    print(f"[SQLITE] Foto duplicada ignorada: {nodo_id} {timestamp_foto}")
-                else:
-                    print(f"[SQLITE] Foto histórica guardada: {nodo_id} {timestamp_foto}")
-
-            solicitar_sincronizacion()
-        except Exception as e:
-            print(f"[SQLITE] Error guardando foto de {nodo_id}: {e}")
-
-        # ── Persistir en estado_nodos (siempre, independiente de la UI) ──
+        hora = ahora.strftime("%H:%M:%S")
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            med = conn.execute("SELECT id FROM mediciones WHERE nodo_id=? ORDER BY id DESC LIMIT 1", (nodo_id,)).fetchone()
+            med_id = med[0] if med else None
+            conn.execute("""INSERT OR IGNORE INTO fotos
+                (nodo_id,timestamp,ruta,tam_bytes,enviado,medicion_id) VALUES(?,?,?,?,0,?)""",
+                (nodo_id, timestamp_foto, ruta_jpg, len(img_bytes), med_id))
+            conn.commit()
+        solicitar_sincronizacion()
         if nodo_id in estado_nodos:
-            estado_nodos[nodo_id]["ultima_imagen_b64"] = clean_b64
-            estado_nodos[nodo_id]["ultima_imagen_ts"]  = hora
+            estado_nodos[nodo_id]["ultima_imagen_b64"] = base64.b64encode(img_bytes).decode("ascii")
+            estado_nodos[nodo_id]["ultima_imagen_ts"] = hora
+            estado_nodos[nodo_id]["ultima_imagen_ruta"] = ruta_jpg
             estado_nodos[nodo_id]["imagen_gen"] = estado_nodos[nodo_id].get("imagen_gen", 0) + 1
-        else:
-            print(f"[CAM] Advertencia: nodo_id '{nodo_id}' no existe en estado_nodos")
-
-        # ── Actualizar UI en vivo si el dashboard está abierto en ese nodo ──
-        ctrl = _cam_buffer.get("img_ctrl")
-        txt  = _cam_buffer.get("txt_ctrl")
-        pg   = _cam_buffer.get("page")
+        ctrl, txt, pg = _cam_buffer.get("img_ctrl"), _cam_buffer.get("txt_ctrl"), _cam_buffer.get("page")
         if ctrl and pg and _cam_buffer.get("nodo_id") == nodo_id:
-            ctrl.src = f"data:image/jpeg;base64,{clean_b64}"
+            ctrl.src = f"data:image/jpeg;base64,{base64.b64encode(img_bytes).decode('ascii')}"
             if txt:
-                txt.value  = f"Última foto: {hora}  —  {tam_kb} KB"
+                txt.value = f"Última foto: {hora} — {len(img_bytes)/1024:.1f} KB"
                 txt.italic = False
-            try:
-                pg.update()
-            except Exception:
-                pass
-            print("[CAM] Imagen mostrada en dashboard activo")
-        else:
-            print(f"[CAM] Imagen guardada en estado_nodos[{nodo_id}] (dashboard cerrado o es otro nodo)")
-
-        # Notificar callbacks para que cualquier vista activa reaccione
+            try: pg.update()
+            except Exception: pass
         notificar_actualizacion()
-
+        aplicar_limpieza_almacenamiento()
     except Exception as e:
         print(f"[CAM] Error procesando imagen: {e}")
-        txt = _cam_buffer.get("txt_ctrl")
-        pg  = _cam_buffer.get("page")
-        if txt and pg:
-            txt.value  = f"Error al recibir imagen: {e}"
-            txt.italic = True
-            try:
-                pg.update()
-            except Exception:
-                pass
 
-# ══════════════════════════════════════════════════════════════════════
-#  SERVIDOR HTTP — Recepción de fotos del ESP32-S3 CAM
-#  Reemplaza el flujo anterior de MQTT + Base64 fragmentado (cam/start,
-#  cam/data, cam/end). El ESP32 ahora hace un POST binario directo aquí.
-# ══════════════════════════════════════════════════════════════════════
 class _PhotoUploadHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # silencia el log default de http.server; usamos nuestros prints
@@ -1564,9 +1553,9 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:7px;borde
 <div id="estado" class="status"></div>
 <section class="grid">
   <div class="card"><h3>Última medición</h3><div id="metricas" class="metrics"><div class="metric"><small>Temperatura</small><strong>--</strong></div></div></div>
-  <div class="card"><h3>Última fotografía</h3><img id="foto" alt="Última fotografía del nodo"><div id="fotoInfo" class="status">Pulsa «Solicitar fotografía» para consultar SQLite.</div></div>
+  <div class="card"><h3>Última fotografía</h3><img id="foto" alt="Última fotografía del nodo"><div id="fotoInfo" class="status">Pulsa «Solicitar fotografía» para consultar el archivo guardado.</div></div>
 </section>
-<section class="card"><h3>Configuración de horarios</h3><div id="horarios" class="horarios"></div><div class="acciones"><button onclick="agregarHorario()">+ Añadir horario</button><button onclick="guardarHorarios()">Enviar configuración</button></div><div id="configEstado" class="status"></div></section>
+<section class="card"><h3>Configuración de horarios</h3><div id="horarios" class="horarios"></div><div class="acciones"><button onclick="agregarHorario()">+ Añadir horario</button><button onclick="guardarHorarios()">Enviar configuración</button></div><div id="configEstado" class="status"></div><div id="horariosActuales" class="status"></div></section>
 <section class="card"><h3>Historial</h3><div id="historial" class="table-wrap">Pulsa «Consultar historial».</div></section>
 </main>
 <script>
@@ -1581,8 +1570,8 @@ async function cargarDatos(){try{const d=await (await api(`/api/nodos/${nodo()}/
 async function cargarFoto(){try{$('foto').src=`/api/nodos/${nodo()}/foto?t=${Date.now()}`;const r=await api(`/api/nodos/${nodo()}/foto/meta`);const d=await r.json();$('fotoInfo').textContent=`Última foto: ${d.timestamp} · ${Math.round(d.tam_bytes/1024)} KB`;setEstado('Fotografía consultada desde SQLite.',true)}catch(e){$('foto').removeAttribute('src');$('fotoInfo').textContent=e.message;setEstado(e.message)}}
 function renderHorarios(){horarios.forEach((h,i)=>{});$('horarios').innerHTML=horarios.map((h,i)=>`<div class="horario"><input type="time" value="${h}" onchange="horarios[${i}]=this.value"><button onclick="horarios.splice(${i},1);renderHorarios()">×</button></div>`).join('')}
 function agregarHorario(){let usados=new Set(horarios),v='00:00';for(let m=0;m<1440;m++){v=String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');if(!usados.has(v))break}horarios.push(v);horarios.sort();renderHorarios()}
-async function cargarConfig(){try{const d=await (await api(`/api/nodos/${nodo()}/config`)).json();horarios=d.horarios||[];renderHorarios();$('configEstado').textContent=`Última actualización: ${d.actualizado||'—'}`}catch(e){$('configEstado').textContent=e.message}}
-async function guardarHorarios(){const unicos=[...new Set(horarios.filter(Boolean))].sort();if(!unicos.length){$('configEstado').textContent='Debe existir al menos un horario.';return}if(unicos.length!==horarios.length){$('configEstado').textContent='No se permiten horarios duplicados.';return}try{const d=await (await api(`/api/nodos/${nodo()}/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({horarios:unicos})})).json();horarios=d.horarios;renderHorarios();$('configEstado').textContent=`Configuración enviada por MQTT: ${horarios.join(', ')}`;setEstado('Configuración guardada en SQLite y publicada por MQTT.',true)}catch(e){$('configEstado').textContent=e.message}}
+async function cargarConfig(){try{const d=await (await api(`/api/nodos/${nodo()}/config`)).json();horarios=d.horarios||[];renderHorarios();$('configEstado').textContent=`Última actualización: ${d.actualizado||'—'}`;$('horariosActuales').textContent=`Horas configuradas actualmente: ${horarios.join(', ')||'sin horarios'} · Horas configuradas desde: ${d.origen||'origen desconocido'}`}catch(e){$('configEstado').textContent=e.message}}
+async function guardarHorarios(){const unicos=[...new Set(horarios.filter(Boolean))].sort();if(!unicos.length){$('configEstado').textContent='Debe existir al menos un horario.';return}if(unicos.length!==horarios.length){$('configEstado').textContent='No se permiten horarios duplicados.';return}try{const d=await (await api(`/api/nodos/${nodo()}/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({horarios:unicos})})).json();horarios=d.horarios;renderHorarios();$('configEstado').textContent=`Configuración enviada por MQTT: ${horarios.join(', ')}`;$('horariosActuales').textContent=`Horas configuradas actualmente: ${horarios.join(', ')} · Horas configuradas desde: Interfaz web local`;setEstado('Configuración guardada en SQLite y publicada por MQTT.',true)}catch(e){$('configEstado').textContent=e.message}}
 async function cargarHistorial(){try{const d=await (await api(`/api/nodos/${nodo()}/historial?limite=100`)).json();if(!d.datos.length){$('historial').textContent='Sin registros.';return}let h='<table><thead><tr><th>Fecha</th><th>T.Amb</th><th>H.Amb</th><th>N</th><th>P</th><th>K</th><th>H.Suelo</th><th>T.Suelo</th><th>EC</th><th>pH</th><th>Bat.</th></tr></thead><tbody>';for(const r of d.datos){const a=r.dht||{},s=r.suelo||{},b=r.bateria||{};h+=`<tr><td>${r.timestamp||'—'}</td><td>${a.t??'—'}</td><td>${a.h??'—'}</td><td>${s.N??'—'}</td><td>${s.P??'—'}</td><td>${s.K??'—'}</td><td>${s.hum??'—'}</td><td>${s.temp??'—'}</td><td>${s.ec??'—'}</td><td>${s.ph??'—'}</td><td>${b.porcentaje??'—'}</td></tr>`}$('historial').innerHTML=h+'</tbody></table>';setEstado(`${d.cantidad} registros consultados desde SQLite.`,true)}catch(e){$('historial').textContent=e.message}}
 $('nodo').addEventListener('change',()=>{cargarConfig();$('historial').textContent='Pulsa «Consultar historial».';$('foto').removeAttribute('src')});
 cargarNodos();
@@ -1621,28 +1610,22 @@ def api_historial(nodo_id: str, limite: int = 100):
 
 
 def _foto_sqlite(nodo_id):
-    """Devuelve la fotografía más reciente del nodo."""
+    """Devuelve los metadatos de la última foto, sin leer bytes desde SQLite."""
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-        return conn.execute("""
-            SELECT timestamp, imagen, tam_bytes
-            FROM fotos
-            WHERE nodo_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-        """, (nodo_id,)).fetchone()
+        return conn.execute("""SELECT timestamp,ruta,tam_bytes FROM fotos
+            WHERE nodo_id=? ORDER BY id DESC LIMIT 1""", (nodo_id,)).fetchone()
 
 
 @app.get("/api/nodos/{nodo_id}/foto")
 def api_foto(nodo_id: str):
     _validar_nodo(nodo_id)
     row = _foto_sqlite(nodo_id)
-    if row is None:
+    if row is None or not os.path.isfile(row[1]):
         raise HTTPException(status_code=404, detail="El nodo todavía no tiene fotografías")
-    timestamp, imagen, tam_bytes = row
+    with open(row[1], "rb") as f:
+        imagen = f.read()
     return Response(content=imagen, media_type="image/jpeg", headers={
-        "X-Foto-Timestamp": timestamp,
-        "X-Foto-Tamano": str(tam_bytes),
-    })
+        "X-Foto-Timestamp": row[0], "X-Foto-Tamano": str(row[2])})
 
 
 @app.get("/api/nodos/{nodo_id}/foto/meta")
@@ -1651,64 +1634,65 @@ def api_foto_meta(nodo_id: str):
     row = _foto_sqlite(nodo_id)
     if row is None:
         raise HTTPException(status_code=404, detail="El nodo todavía no tiene fotografías")
-    return {"nodo_id": nodo_id, "timestamp": row[0], "tam_bytes": row[2]}
+    return {"nodo_id": nodo_id, "timestamp": row[0], "tam_bytes": row[2], "ruta": row[1]}
 
 
 @app.get("/api/nodos/{nodo_id}/fotos/historial")
 def api_fotos_historial(nodo_id: str, limite: int = 100):
-    """Devuelve el historial de fotografías almacenadas localmente."""
     _validar_nodo(nodo_id)
     limite = max(1, min(int(limite), 5000))
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-        rows = conn.execute("""
-            SELECT id, timestamp, tam_bytes, enviado
-            FROM fotos
-            WHERE nodo_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (nodo_id, limite)).fetchall()
-
-    return {
-        "nodo_id": nodo_id,
-        "cantidad": len(rows),
-        "fotos": [
-            {
-                "id": row[0],
-                "timestamp": row[1],
-                "tam_bytes": row[2],
-                "enviado": row[3],
-                "url": f"/api/nodos/{nodo_id}/fotos/{row[0]}",
-            }
-            for row in rows
-        ],
-    }
+        rows = conn.execute("""SELECT id,timestamp,ruta,tam_bytes,enviado FROM fotos
+            WHERE nodo_id=? ORDER BY id DESC LIMIT ?""", (nodo_id, limite)).fetchall()
+    return {"nodo_id": nodo_id, "cantidad": len(rows), "fotos": [
+        {"id": r[0], "timestamp": r[1], "ruta": r[2], "tam_bytes": r[3],
+         "enviado": r[4], "url": f"/api/nodos/{nodo_id}/fotos/{r[0]}"}
+        for r in rows]}
 
 
 @app.get("/api/nodos/{nodo_id}/fotos/{id_foto}")
 def api_foto_historica(nodo_id: str, id_foto: int):
-    """Devuelve una fotografía concreta del historial local."""
     _validar_nodo(nodo_id)
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-        row = conn.execute("""
-            SELECT timestamp, imagen, tam_bytes
-            FROM fotos
-            WHERE id = ? AND nodo_id = ?
-        """, (id_foto, nodo_id)).fetchone()
-
-    if row is None:
+        row = conn.execute("""SELECT timestamp,ruta,tam_bytes FROM fotos
+            WHERE id=? AND nodo_id=?""", (id_foto, nodo_id)).fetchone()
+    if row is None or not os.path.isfile(row[1]):
         raise HTTPException(status_code=404, detail="Fotografía no encontrada")
+    with open(row[1], "rb") as f: imagen = f.read()
+    return Response(content=imagen, media_type="image/jpeg", headers={
+        "X-Foto-Timestamp": row[0], "X-Foto-Tamano": str(row[2])})
 
-    return Response(content=row[1], media_type="image/jpeg", headers={
-        "X-Foto-Timestamp": row[0],
-        "X-Foto-Tamano": str(row[2]),
-    })
+
+@app.get("/api/almacenamiento")
+def api_almacenamiento():
+    return estado_almacenamiento()
+
+
+class ConfigAlmacenamientoAPI(BaseModel):
+    max_mb: int
+    eliminar_cantidad: int
+
+
+@app.post("/api/almacenamiento")
+def api_guardar_almacenamiento(config: ConfigAlmacenamientoAPI):
+    if config.max_mb < 100 or config.eliminar_cantidad < 1:
+        raise HTTPException(status_code=400, detail="El límite mínimo es 100 MB y el lote debe ser mayor que cero.")
+    guardar_config_almacenamiento(config.max_mb, config.eliminar_cantidad)
+    aplicar_limpieza_almacenamiento()
+    return estado_almacenamiento()
 
 
 @app.get("/api/nodos/{nodo_id}/config")
 def api_config_get(nodo_id: str):
     _validar_nodo(nodo_id)
     cfg = sqlite_config(nodo_id)
-    return {"nodo_id": nodo_id, "horarios": _normalizar_horarios(cfg.get("horas", [])), "actualizado": cfg.get("actualizado", "—")}
+    topic_cfg = estado_config_horarios.get(nodo_id)
+    if topic_cfg:
+        cfg = {"horas": topic_cfg["horarios"], "actualizado": topic_cfg["actualizado"], "origen": topic_cfg["origen"]}
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        row = conn.execute("SELECT origen FROM configuraciones WHERE nodo_id=?", (nodo_id,)).fetchone()
+    origen = topic_cfg["origen"] if topic_cfg else (row[0] if row else cfg.get("origen", "Raspberry (configuración local)"))
+    return {"nodo_id": nodo_id, "horarios": _normalizar_horarios(cfg.get("horas", [])), "actualizado": cfg.get("actualizado", "—"), "origen": origen}
 
 
 @app.post("/api/nodos/{nodo_id}/config")
@@ -1724,6 +1708,7 @@ def api_config_post(nodo_id: str, config: ConfigHorarioAPI):
     payload = json.dumps({
         "horas": [int(h.split(":")[0]) for h in horarios],
         "minutos": [int(h.split(":")[1]) for h in horarios],
+        "origen": "Interfaz web local",
     })
     ok = mqtt_publicar_config(payload, nodo_id)
     mqtt_publicar_hora(nodo_id)
@@ -1731,8 +1716,10 @@ def api_config_post(nodo_id: str, config: ConfigHorarioAPI):
         raise HTTPException(status_code=503, detail="No se pudo publicar la configuración mediante MQTT")
 
     guardar_config_nodo(nodo_id, horarios)
-    if not guardar_config_sqlite(nodo_id, horarios):
+    if not guardar_config_sqlite(nodo_id, horarios, "Interfaz web local"):
         raise HTTPException(status_code=500, detail="La configuración fue enviada por MQTT, pero no pudo guardarse en SQLite")
+    estado_config_horarios[nodo_id] = {"horarios": horarios, "origen": "Interfaz web local",
+        "actualizado": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
     return {"ok": True, "nodo_id": nodo_id, "horarios": horarios, "mqtt": "enviado", "actualizado": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
@@ -2162,6 +2149,9 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
 def build_config(nodo, page, on_volver):
     nodo_id = nodo["id"]
     cfg = sqlite_config(nodo_id)
+    _cfg_topic = estado_config_horarios.get(nodo_id)
+    if _cfg_topic:
+        cfg = {"horas": _cfg_topic["horarios"], "actualizado": _cfg_topic["actualizado"], "origen": _cfg_topic["origen"]}
     horarios_guardados = _normalizar_horarios(cfg.get("horas", ["10:00", "18:00"]))
 
     # Modos rápidos de 2 y 3 medidas + modo personalizado.
@@ -2183,8 +2173,45 @@ def build_config(nodo, page, on_volver):
 
     estado_txt = ft.Text(
         f'Horario activo: {len(horarios_guardados)} medidas/dia  -  '
-        f'Ultima actualizacion: {cfg.get("actualizado", "--")}',
+        f'Ultima actualizacion: {cfg.get("actualizado", "--")}  |  Desde: {cfg.get("origen", "Raspberry (configuración local)")}',
         size=9, color=C["gris_texto"], italic=True)
+
+    origen_horarios_txt = ft.Text(
+        f'Horas configuradas actualmente: {", ".join(horarios_guardados) or "sin horarios"}  |  Horas configuradas desde: {cfg.get("origen", "Raspberry (configuración local)")}',
+        size=9, color=C["azul_oscuro"], italic=True)
+    _storage_cfg = cargar_config_almacenamiento()
+    storage_max_input = ft.TextField(label="Límite carpeta AgroTech (MB)", value=str(_storage_cfg["max_mb"]), width=220, dense=True, keyboard_type=ft.KeyboardType.NUMBER)
+    storage_delete_input = ft.TextField(label="Datos/fotos por lote", value=str(_storage_cfg["eliminar_cantidad"]), width=180, dense=True, keyboard_type=ft.KeyboardType.NUMBER)
+    _st_inicial = estado_almacenamiento()
+    storage_status = ft.Text(
+        f'Carpeta: {_st_inicial["total_bytes"]/1048576:.1f} MB / {_st_inicial["max_mb"]} MB · '
+        f'Datos: {_st_inicial["datos_cantidad"]} ({_st_inicial["datos_payload_bytes"]/1024:.1f} KB) · '
+        f'Fotos: {_st_inicial["fotos_cantidad"]} ({_st_inicial["fotos_bytes"]/1048576:.1f} MB)',
+        size=9, color=C["gris_texto"])
+
+    def guardar_almacenamiento_ui(e=None):
+        try:
+            guardar_config_almacenamiento(int(storage_max_input.value), int(storage_delete_input.value))
+            aplicar_limpieza_almacenamiento()
+            st = estado_almacenamiento()
+            storage_status.value = (f'Carpeta: {st["total_bytes"]/1048576:.1f} MB / {st["max_mb"]} MB · '
+                                    f'Datos: {st["datos_cantidad"]} ({st["datos_payload_bytes"]/1024:.1f} KB) · '
+                                    f'Fotos: {st["fotos_cantidad"]} ({st["fotos_bytes"]/1048576:.1f} MB)')
+            storage_status.color = C["verde"]
+        except Exception as ex:
+            storage_status.value = f"Error de configuración: {ex}"
+            storage_status.color = C["rojo"]
+        try: page.update()
+        except Exception: pass
+
+    def refrescar_horarios_desde_mqtt():
+        actual = estado_config_horarios.get(nodo_id)
+        if actual:
+            origen_horarios_txt.value = f'Horas configuradas actualmente: {", ".join(actual["horarios"])}  |  Horas configuradas desde: {actual["origen"]}'
+            try: page.update()
+            except Exception: pass
+
+    registrar_callback(refrescar_horarios_desde_mqtt)
 
     btn_2med = ft.Container(border_radius=8, padding=ft.Padding.all(8))
     btn_3med = ft.Container(border_radius=8, padding=ft.Padding.all(8))
@@ -2630,6 +2657,7 @@ def build_config(nodo, page, on_volver):
         payload = json.dumps({
             "horas": horas_payload,
             "minutos": minutos_payload,
+            "origen": "Interfaz de la Raspberry",
         })
 
         # v12: limpio la confirmación anterior y publico al tópico del nodo
@@ -2638,7 +2666,7 @@ def build_config(nodo, page, on_volver):
         mqtt_publicar_hora(nodo_id)   # v13: sincroniza el DS3231 si el nodo esta en modo config
         if ok:
             guardar_config_nodo(nodo_id, horarios)
-            guardar_config_sqlite(nodo_id, horarios)
+            guardar_config_sqlite(nodo_id, horarios, "Base de datos en la nube")
 
             resultado.bgcolor = C["verde_suave"]
             resultado.border = ft.Border.all(1.5, C["verde_borde"])
@@ -2720,10 +2748,14 @@ def build_config(nodo, page, on_volver):
     # Revalidar después de crear el botón.
     validar_horarios()
 
+    def volver_config(e=None):
+        desregistrar_callback(refrescar_horarios_desde_mqtt)
+        on_volver()
+
     return ft.Column([
         barra_superior(
             f'Configuracion - {nodo["nombre"]}',
-            on_back=lambda e: on_volver()),
+            on_back=volver_config),
         ft.Container(
             expand=True,
             bgcolor=C["fondo"],
@@ -2753,6 +2785,7 @@ def build_config(nodo, page, on_volver):
                 ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Divider(color=C["gris_borde"], height=1),
                 estado_txt,
+                origen_horarios_txt,
                 ft.Container(height=2),
                 ft.Text(
                     "Selecciona cantidad de medidas:",
@@ -2778,6 +2811,11 @@ def build_config(nodo, page, on_volver):
                 horarios_scroll,
                 ft.Container(height=4),
                 resultado,
+                ft.Divider(color=C["gris_borde"], height=1),
+                ft.Text("Almacenamiento local", size=11, weight=ft.FontWeight.BOLD, color=C["negro_texto"]),
+                ft.Row([storage_max_input, storage_delete_input,
+                        ft.FilledButton("Guardar límite", on_click=guardar_almacenamiento_ui)], spacing=8, wrap=True),
+                storage_status,
             ], spacing=6, expand=True)),
     ], spacing=0, expand=True)
 
@@ -3021,6 +3059,7 @@ def main(page: ft.Page):
 
     # Persistencia SQLite: fuente de verdad para la API web.
     sqlite_iniciar()
+    aplicar_limpieza_almacenamiento()
 
     # Sincronización HTTP con el servidor en la nube.
     sincronizador_iniciar()
