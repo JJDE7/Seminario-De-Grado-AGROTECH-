@@ -1,9 +1,10 @@
 """
 AgroTech Dashboard + FastAPI — Compatible con Flet 0.84+
-v4.0.1 — Cambios principales:
+v4.0.2 — Cambios principales:
 - Corrección de migración SQLite: Se elimina dinámicamente la columna 'payload' de BDs antiguas.
 - Algoritmo de ML (Isolation Forest) integrado para detección de anomalías (9 Dimensiones: incl. NPK).
 - Tabla 'alertas' añadida para registrar anomalías multivariables con severidad.
+- Sincronización del estado de alertas (Reconocida, Resuelta) desde la nube (API GET).
 - Campo 'payload' descartado; los JSON se reconstruyen al vuelo desde la BD.
 """
 
@@ -48,8 +49,8 @@ FASTAPI_PORT = 8000
 CLOUD_SERVER_URL = "https://felipegmezm.pythonanywhere.com/"
 CLOUD_API_KEY = "cM5STVFFparbVC6RuZmlEYB-B_H4GCSIwbWNulekgFDL3CpLlqRiTIvCCzko6idx"
 CLOUD_TIMEOUT = 15
-CLOUD_SYNC_INTERVAL = 30
 
+CLOUD_SYNC_INTERVAL = 30
 CONFIG_CLOUD_SYNC_INTERVAL = 30
 
 AGROTECH_DIR = os.path.expanduser("~/agrotech")
@@ -338,6 +339,9 @@ def guardar_sqlite(nodo_id, dato, timestamp):
 # ══════════════════════════════════════════════════════════════════════
 #  MACHINE LEARNING — ISOLATION FOREST
 # ══════════════════════════════════════════════════════════════════════
+
+#Entrenamiento comentado para mantener el modelo "congelado"
+'''
 def entrenar_modelo_iforest():
     """Extrae datos históricos y entrena el modelo de detección de anomalías."""
     try:
@@ -361,6 +365,7 @@ def entrenar_modelo_iforest():
         print("[ML] Modelo Isolation Forest entrenado y guardado con éxito.")
     except Exception as e:
         print(f"[ML] Error entrenando modelo: {e}")
+'''
 
 def evaluar_anomalias(nodo_id, timestamp, registro):
     """Evalúa la medición actual en busca de anomalías y genera alertas."""
@@ -1072,7 +1077,7 @@ def mqtt_borrar_config_retenida(nodo_id: str = "nodo2") -> bool:
         return False
 
 # ══════════════════════════════════════════════════════════════════════
-#  SINCRONIZACIÓN DE CONFIGURACIONES DE HORARIO CON LA NUBE
+#  SINCRONIZACIÓN DE CONFIGURACIONES Y ESTADOS DE ALERTAS
 # ══════════════════════════════════════════════════════════════════════
 _config_sync_event = threading.Event()
 _config_sync_lock = threading.Lock()
@@ -1198,6 +1203,60 @@ def sincronizar_configuraciones_con_nube():
     except Exception as e:
         print(f"[CONFIG-CLOUD] Error general: {e}")
 
+def sincronizar_estados_alertas_con_nube():
+    """Obtiene los estados actuales de las alertas desde el servidor en la nube y actualiza la tabla local."""
+    if not CLOUD_SERVER_URL or "TU-DOMINIO" in CLOUD_SERVER_URL:
+        return
+    try:
+        for nodo in NODOS:
+            if not nodo["activo"]: continue
+            nodo_id = nodo["id"]
+            nodo_numero = nodo_id.replace("nodo", "", 1)
+            
+            url = _cloud_url(f"/api/nodos/{nodo_numero}/alertas")
+            
+            # Solución al 401: Para un GET, enviamos SOLO el X-API-Key, sin el Content-Type
+            headers_get = {"X-API-Key": CLOUD_API_KEY}
+            
+            respuesta = requests.get(url, headers=headers_get, timeout=CLOUD_TIMEOUT)
+            
+            if not respuesta.ok:
+                print(f"[SYNC-ALERTAS] Error HTTP {respuesta.status_code} al consultar {url}")
+                continue
+            
+            cuerpo = respuesta.json()
+            
+            # Solución de estructura: Extraemos directamente la clave "datos"
+            alertas_nube = cuerpo.get("datos", [])
+            
+            if not isinstance(alertas_nube, list):
+                print(f"[SYNC-ALERTAS] Estructura inesperada del servidor para {nodo_id}. Respuesta: {str(cuerpo)[:100]}...")
+                continue
+
+            cambios = 0
+            with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+                cursor = conn.cursor()
+                for al_nube in alertas_nube:
+                    estado_nube = al_nube.get("estado")
+                    timestamp = al_nube.get("timestamp")
+                    
+                    if estado_nube and timestamp:
+                        # Solo actualizamos (y contamos) si el estado recibido es diferente al local
+                        cursor.execute(
+                            "UPDATE alertas SET estado = ? WHERE nodo_id = ? AND timestamp = ? AND estado != ?",
+                            (estado_nube, nodo_id, timestamp, estado_nube)
+                        )
+                        cambios += cursor.rowcount
+                conn.commit()
+            
+            # Refrescar la interfaz gráfica de Flet de inmediato si se detectaron modificaciones
+            if cambios > 0:
+                print(f"[SYNC-ALERTAS] ¡Éxito! Se actualizaron {cambios} alertas de {nodo_id}.")
+                notificar_actualizacion()
+                
+    except Exception as e:
+        print(f"[SYNC-ALERTAS] Error crítico sincronizando estados con la nube: {e}")
+
 def solicitar_sincronizacion_configuraciones():
     _config_sync_event.set()
 
@@ -1216,7 +1275,9 @@ def sincronizador_configuraciones_iniciar():
             _config_sync_event.wait(timeout=CONFIG_CLOUD_SYNC_INTERVAL)
             _config_sync_event.clear()
             try:
+                # Sincronización combinada del Cloud Interval
                 sincronizar_configuraciones_con_nube()
+                sincronizar_estados_alertas_con_nube()
             except Exception as e:
                 print(f"[CONFIG-CLOUD] Error en ciclo: {e}")
 
@@ -1579,7 +1640,7 @@ def build_inicio(on_inicio):
                             padding=ft.Padding.symmetric(horizontal=32,vertical=12),elevation=10),
                         on_click=on_inicio, width=220),
                     ft.Container(height=20),
-                    ft.Text("v4.0.1 · Quindío, Colombia",size=11,
+                    ft.Text("v4.0.2 · Quindío, Colombia",size=11,
                             color=ft.Colors.with_opacity(0.35,ft.Colors.WHITE)),
                 ], alignment=ft.MainAxisAlignment.CENTER,
                    horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)),
@@ -1696,8 +1757,19 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
         else:
             columnas = []
             for al in alertas_db:
-                color_icono = C["rojo"] if al[3] == "Crítica" else C["amarillo"]
-                icono = ft.Icons.WARNING if al[3] == "Crítica" else ft.Icons.ERROR_OUTLINE
+                estado_alerta = al[5]
+                severidad = al[3]
+                
+                # Modificamos los colores dependiendo de la información sincada de la nube
+                if estado_alerta == "Resuelta":
+                    color_icono = C["verde"]
+                    icono = ft.Icons.CHECK_CIRCLE
+                elif estado_alerta == "Reconocida":
+                    color_icono = C["azul"]
+                    icono = ft.Icons.INFO_OUTLINE
+                else:
+                    color_icono = C["rojo"] if severidad == "Crítica" else C["amarillo"]
+                    icono = ft.Icons.WARNING if severidad == "Crítica" else ft.Icons.ERROR_OUTLINE
                 
                 columnas.append(
                     ft.Container(
@@ -1707,11 +1779,11 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                             ft.Icon(icono, color=color_icono, size=24),
                             ft.Column([
                                 ft.Row([
-                                    ft.Text(al[3].upper(), size=10, weight=ft.FontWeight.BOLD, color=color_icono),
+                                    ft.Text(severidad.upper(), size=10, weight=ft.FontWeight.BOLD, color=color_icono),
                                     ft.Text(al[0], size=9, color=C["gris_texto"]),
                                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, expand=True),
                                 ft.Text(al[4], size=11, color=C["negro_texto"]),
-                                ft.Text(f"Tipo: {al[1]} | Score ML: {al[2]:.3f} | Estado: {al[5]}", size=9, color=C["gris_texto"])
+                                ft.Text(f"Tipo: {al[1]} | Score ML: {al[2]:.3f} | Estado: {estado_alerta}", size=9, color=C["gris_texto"])
                             ], spacing=2, expand=True)
                         ])
                     )
@@ -2772,7 +2844,7 @@ def build_historico(nodo, page, on_volver):
 #  APLICACIÓN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════
 def main(page: ft.Page):
-    page.title = "AgroTech Dashboard v4.0.1"
+    page.title = "AgroTech Dashboard v4.0.2"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
     try:
@@ -2786,7 +2858,7 @@ def main(page: ft.Page):
 
     sqlite_iniciar()
     # Entrenar modelo de anomalías si existen suficientes datos sanos.
-    entrenar_modelo_iforest()
+    #entrenar_modelo_iforest()
     aplicar_limpieza_almacenamiento()
     sincronizador_iniciar()
 
