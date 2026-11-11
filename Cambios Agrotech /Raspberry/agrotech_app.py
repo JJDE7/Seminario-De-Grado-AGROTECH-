@@ -37,8 +37,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 NODOS = [
     {"id":"nodo1","nombre":"Nodo 1 · Parcela A","topic":"esp32/nodo1/data","camera_ip":"192.168.137.20","activo":True},
-    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":"192.168.137.21","activo":True}, #Aqui se desactivo manualmente el nodo
-    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":"192.168.137.22","activo":True}, #Aqui se desactivo manualmente el nodo
+    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":"192.168.137.20","activo":True},
+    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":"192.168.137.20","activo":True},
     {"id":"nodo4","nombre":"Nodo 4 · Reserva","topic":"esp32/nodo4/data","camera_ip":None,"activo":False},   #Aqui se desactivo manualmente el nodo
 ]
 
@@ -967,14 +967,23 @@ def build_config(nodo, page, on_volver):
     btn_3med = ft.Container(border_radius=8, padding=ft.Padding.all(8))
     btn_nmed = ft.Container(border_radius=8, padding=ft.Padding.all(8))
 
-    # Lista vertical en lugar de Row(wrap=True): evita recalcular
-    # continuamente el ajuste de cientos de tarjetas.
-    dropdowns_container = ft.ListView(
+    # Matriz preordenada: cada fila contiene un número fijo de medidas.
+    # Esto conserva el rendimiento de ListView sin dejar una tarjeta
+    # ocupando todo el ancho de la pantalla.
+    # 6 columnas dan una distribución compacta y estable en escritorio.
+    COLUMNAS_POR_FILA = 10
+
+    dropdowns_container = ft.Column(
+        spacing=8,
+        tight=True,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    horarios_scroll = ft.ListView(
+        controls=[dropdowns_container],
         expand=True,
-        spacing=6,
+        spacing=0,
         auto_scroll=False,
     )
-    horarios_scroll = dropdowns_container
 
     num_display = ft.Text(
         str(num_custom["v"]), size=15,
@@ -1152,9 +1161,24 @@ def build_config(nodo, page, on_volver):
         while len(horarios) < n:
             horarios.append(siguiente_horario_libre(horarios))
 
-        dropdowns_container.controls = [
+        controles = [
             hacer_dropdown(horarios[i], i + 1) for i in range(n)
         ]
+
+        # Distribución preordenada en filas de 6. No usamos wrap dinámico:
+        # Flet solo necesita calcular la posición de estas filas ya definidas.
+        filas = []
+        for inicio in range(0, len(controles), COLUMNAS_POR_FILA):
+            grupo = controles[inicio:inicio + COLUMNAS_POR_FILA]
+            fila = ft.Row(
+                grupo,
+                spacing=8,
+                run_spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+            filas.append(fila)
+
+        dropdowns_container.controls = filas
         validar_horarios()
 
     def agregar_medida_custom():
@@ -1169,9 +1193,24 @@ def build_config(nodo, page, on_volver):
         num_custom["v"] = n_actual + 1
         num_display.value = str(num_custom["v"])
 
-        dropdowns_container.controls.append(
-            hacer_dropdown(nuevo, num_custom["v"])
-        )
+        nueva_tarjeta = hacer_dropdown(nuevo, num_custom["v"])
+
+        if (
+            dropdowns_container.controls
+            and len(dropdowns_container.controls[-1].controls) < COLUMNAS_POR_FILA
+        ):
+            # Todavía hay espacio en la última fila.
+            dropdowns_container.controls[-1].controls.append(nueva_tarjeta)
+        else:
+            # La última fila ya tiene 6: crear la siguiente fila.
+            dropdowns_container.controls.append(
+                ft.Row(
+                    [nueva_tarjeta],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                )
+            )
+
         validar_horarios()
         page.update()
 
@@ -1181,8 +1220,13 @@ def build_config(nodo, page, on_volver):
             return
 
         refs_activos.pop()
+
         if dropdowns_container.controls:
-            dropdowns_container.controls.pop()
+            ultima_fila = dropdowns_container.controls[-1]
+            if ultima_fila.controls:
+                ultima_fila.controls.pop()
+            if not ultima_fila.controls:
+                dropdowns_container.controls.pop()
 
         horarios = horarios_seleccionados["N"]
         if horarios:
@@ -1218,8 +1262,20 @@ def build_config(nodo, page, on_volver):
         else:
             n = int(modo["v"])
             horarios = horarios_seleccionados[modo["v"]]
-            dropdowns_container.controls = [
+            controles = [
                 hacer_dropdown(horarios[i], i + 1) for i in range(n)
+            ]
+
+            # Mismo layout compacto para los modos de cantidad fija.
+            # Normalmente solo habrá 2 o 3 tarjetas, pero mantener una
+            # sola rutina de distribución evita lógica duplicada.
+            dropdowns_container.controls = [
+                ft.Row(
+                    controles[inicio:inicio + COLUMNAS_POR_FILA],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                )
+                for inicio in range(0, len(controles), COLUMNAS_POR_FILA)
             ]
             validar_horarios()
 
