@@ -31,6 +31,7 @@ import threading
 import time          # v12: espera de la confirmacion del nodo
 import base64
 import urllib.request
+import requests
 import os
 from datetime import datetime
 from typing import Optional
@@ -68,6 +69,14 @@ SQLITE_DB = os.path.join(os.path.expanduser("~/agrotech/data"), "agrotech.db")
 # NUEVO: servidor FastAPI para la aplicación web y API REST.
 FASTAPI_HOST = "0.0.0.0"
 FASTAPI_PORT = 8000
+
+# SINCRONIZACIÓN CON SERVIDOR EN LA NUBE
+# MQTT sigue siendo exclusivamente ESP32 <-> Raspberry.
+# SQLite conserva una bandera local: enviado=0 pendiente, enviado=1 confirmado.
+CLOUD_SERVER_URL = "https://felipegmezm.pythonanywhere.com/"
+CLOUD_API_KEY = "cM5STVFFparbVC6RuZmlEYB-B_H4GCSIwbWNulekgFDL3CpLlqRiTIvCCzko6idx"
+CLOUD_TIMEOUT = 15
+CLOUD_SYNC_INTERVAL = 30
 
 DATA_DIR    = os.path.expanduser("~/agrotech/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -137,6 +146,31 @@ def sqlite_iniciar():
                     actualizado TEXT NOT NULL
                 )
             """)
+
+            # 0 = pendiente, 1 = confirmado por el servidor.
+            # Se agrega de forma compatible a una base SQLite ya existente.
+            columnas_med = {row[1] for row in conn.execute(
+                "PRAGMA table_info(mediciones)").fetchall()}
+            if "enviado" not in columnas_med:
+                conn.execute(
+                    "ALTER TABLE mediciones ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
+                )
+
+            columnas_foto = {row[1] for row in conn.execute(
+                "PRAGMA table_info(fotos)").fetchall()}
+            if "enviado" not in columnas_foto:
+                conn.execute(
+                    "ALTER TABLE fotos ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
+                )
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mediciones_enviado
+                ON mediciones(enviado, id)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fotos_enviado
+                ON fotos(enviado, nodo_id)
+            """)
             conn.commit()
         print(f"[SQLITE] Base de datos lista: {SQLITE_DB}")
         return True
@@ -183,9 +217,12 @@ def guardar_sqlite(nodo_id, dato, timestamp):
                 _numero(bateria.get("porcentaje")),
                 json.dumps(dato, ensure_ascii=False),
             ))
+            id_medicion = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit()
+            return id_medicion
     except Exception as e:
         print(f"[SQLITE] Error guardando medición de {nodo_id}: {e}")
+        return None
 
 
 def sqlite_ultimo(nodo_id):
@@ -242,6 +279,156 @@ def sqlite_historial(nodo_id, limite=100):
         print(f"[SQLITE] Error consultando historial: {e}")
         return []
 
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SINCRONIZACIÓN HTTP CON EL SERVIDOR EN LA NUBE
+# ══════════════════════════════════════════════════════════════════════
+_sync_event = threading.Event()
+
+def _cloud_url(path):
+    return CLOUD_SERVER_URL.rstrip("/") + path
+
+def _cloud_headers():
+    return {
+        "X-API-Key": CLOUD_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+def sqlite_mediciones_pendientes(limite=100):
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        return conn.execute("""
+            SELECT id, nodo_id, timestamp, payload
+            FROM mediciones
+            WHERE enviado = 0
+            ORDER BY id ASC
+            LIMIT ?
+        """, (limite,)).fetchall()
+
+def sqlite_marcar_medicion_enviada(id_medicion):
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        conn.execute(
+            "UPDATE mediciones SET enviado = 1 WHERE id = ?",
+            (id_medicion,)
+        )
+        conn.commit()
+
+def sqlite_fotos_pendientes():
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        return conn.execute("""
+            SELECT nodo_id, timestamp, imagen, tam_bytes
+            FROM fotos
+            WHERE enviado = 0
+            ORDER BY timestamp ASC
+        """).fetchall()
+
+def sqlite_marcar_foto_enviada(nodo_id, timestamp):
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        conn.execute("""
+            UPDATE fotos SET enviado = 1
+            WHERE nodo_id = ? AND timestamp = ?
+        """, (nodo_id, timestamp))
+        conn.commit()
+
+def solicitar_sincronizacion():
+    _sync_event.set()
+
+def sincronizar_con_nube():
+    """Envía solo pendientes y confirma cada elemento individualmente."""
+    if not CLOUD_SERVER_URL or "TU-DOMINIO" in CLOUD_SERVER_URL:
+        return
+
+    for id_local, nodo_id, timestamp, payload in sqlite_mediciones_pendientes():
+        try:
+            datos_originales = json.loads(payload)
+            # La bandera es estrictamente local y nunca viaja a la nube.
+            datos_originales.pop("enviado", None)
+
+            # El ESP32/Raspberry guarda localmente solo dht/suelo/bateria,
+            # pero la API de la nube exige además tipo, nodo_id y timestamp.
+            # Construimos aquí el formato del contrato de la nube sin alterar
+            # el payload original almacenado en SQLite.
+            datos = {
+                "tipo": "lectura",
+                "nodo_id": nodo_id,
+                "timestamp": timestamp,
+                **datos_originales,
+            }
+
+            numero_nodo = nodo_id.replace("nodo", "", 1)
+            respuesta = requests.post(
+                _cloud_url(f"/api/nodos/{numero_nodo}/datos"),
+                json=datos,
+                headers=_cloud_headers(),
+                timeout=CLOUD_TIMEOUT
+            )
+
+            if not respuesta.ok:
+                print(f"[SYNC] HTTP {respuesta.status_code} medición {id_local}: {respuesta.text[:300]}")
+                break
+
+            cuerpo = respuesta.json()
+            if cuerpo.get("ok") is True:
+                sqlite_marcar_medicion_enviada(id_local)
+                print(f"[SYNC] Medición local {id_local} confirmada por nube.")
+            else:
+                print(f"[SYNC] Nube rechazó medición {id_local}: {cuerpo}")
+                break
+
+        except Exception as e:
+            print(f"[SYNC] Error enviando medición {id_local}: {e}")
+            break
+
+    for nodo_id, timestamp, imagen, tam_bytes in sqlite_fotos_pendientes():
+        try:
+            numero_nodo = nodo_id.replace("nodo", "", 1)
+            respuesta = requests.post(
+                _cloud_url(f"/api/nodos/{numero_nodo}/foto"),
+                params={"timestamp": timestamp},
+                data=imagen,
+                headers={
+                    "X-API-Key": CLOUD_API_KEY,
+                    "Content-Type": "image/jpeg",
+                    "X-Foto-Timestamp": timestamp,
+                },
+                timeout=CLOUD_TIMEOUT
+            )
+
+            if not respuesta.ok:
+                print(f"[SYNC] HTTP {respuesta.status_code} foto {nodo_id}: {respuesta.text[:300]}")
+                break
+
+            cuerpo = respuesta.json()
+            if cuerpo.get("ok") is True:
+                sqlite_marcar_foto_enviada(nodo_id, timestamp)
+                print(f"[SYNC] Foto de {nodo_id} confirmada por nube.")
+            else:
+                print(f"[SYNC] Nube rechazó foto de {nodo_id}: {cuerpo}")
+                break
+
+        except Exception as e:
+            print(f"[SYNC] Error enviando foto de {nodo_id}: {e}")
+            break
+
+def sincronizador_iniciar():
+    def _run():
+        while True:
+            _sync_event.wait(timeout=CLOUD_SYNC_INTERVAL)
+            _sync_event.clear()
+            try:
+                sincronizar_con_nube()
+            except Exception as e:
+                print(f"[SYNC] Error general: {e}")
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name="agrotech-cloud-sync"
+    ).start()
+
+    # Primera ejecución al arrancar: recupera todo lo que quedó pendiente,
+    # incluido el último dato de cada ESP y las fotografías.
+    solicitar_sincronizacion()
 
 # ══════════════════════════════════════════════════════════════════════
 #  PERSISTENCIA DE DATOS
@@ -592,7 +779,9 @@ def mqtt_iniciar_global(on_update):
                 # 1) JSON existente para la interfaz Flet
                 # 2) SQLite para historial completo y consultas externas
                 guardar_dato(nodo_id, registro)
-                guardar_sqlite(nodo_id, registro, timestamp_medicion)
+                id_medicion = guardar_sqlite(nodo_id, registro, timestamp_medicion)
+                if id_medicion is not None:
+                    solicitar_sincronizacion()
 
                 estado_nodos[nodo_id]["ultima_actualizacion"] = datetime.now()
 
@@ -788,6 +977,7 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
                         tam_bytes=excluded.tam_bytes
                 """, (nodo_id, timestamp_foto, sqlite3.Binary(img_bytes), len(img_bytes)))
                 conn.commit()
+            solicitar_sincronizacion()
         except Exception as e:
             print(f"[SQLITE] Error guardando foto de {nodo_id}: {e}")
 
@@ -2332,6 +2522,9 @@ def main(page: ft.Page):
 
     # Persistencia SQLite: fuente de verdad para la API web.
     sqlite_iniciar()
+
+    # Sincronización HTTP con el servidor en la nube.
+    sincronizador_iniciar()
 
     # Iniciar MQTT global desde el principio (sensores/status/config).
     def global_update():
