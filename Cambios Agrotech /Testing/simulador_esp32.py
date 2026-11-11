@@ -8,7 +8,10 @@ Emula uno o varios nodos ESP32 enviando:
 NUEVAS FUNCIONES (Testing Machine Learning):
 - Consola interactiva para cambiar el comportamiento en tiempo real.
 - Modo "Planta Sana": Datos dentro de lo esperado.
-- Modo "Planta Enferma": Genera anomalías severas (para probar Isolation Forest).
+- Modos de Anomalía Básicos: Alteraciones generales altas y bajas.
+- Modos de Anomalía Mixta/Correlacionada:
+    - Ambiente/Suelo: Caliente y Seco | Frío y Húmedo.
+    - Nutrientes: Exceso de Fertilizante (Salinidad) | Lavado de Nutrientes (Lixiviación).
 - Control de Piramómetro: Habilita/Inhabilita el envío del campo de radiación.
 """
 
@@ -42,8 +45,8 @@ SIMULATED_NODES = [
     "nodo2"
 ]
 
-SENSOR_INTERVAL_SECONDS = 30
-PHOTO_INTERVAL_SECONDS = 30
+SENSOR_INTERVAL_SECONDS = 15
+PHOTO_INTERVAL_SECONDS = 15
 SEND_PHOTO_ON_START = True
 
 IMAGE_EXTENSIONS = {
@@ -59,9 +62,19 @@ CONFIRM_PROBABILITY = 1.0
 # ============================================================
 # VARIABLES DE ESTADO GLOBALES PARA LA CONSOLA (CLI)
 # ============================================================
-sim_mode = "sana"      # Opciones: "sana", "enferma"
-sim_pira = True        # Opciones: True, False
+sim_mode = "sana"      
+sim_pira = True        
 
+
+# ============================================================
+# AGRUPACIÓN DE SENSORES PARA ANOMALÍAS
+# ============================================================
+GRUPOS_ANOMALIAS = {
+    "ambiente": ["dht_temp", "dht_humidity"],
+    "suelo": ["soil_humidity", "soil_temp"],
+    "nutrientes": ["soil_N", "soil_P", "soil_K", "soil_ec", "soil_ph"],
+    "radiacion": ["piramometro_rad"]
+}
 
 # ============================================================
 # RANGOS DE LOS SENSORES
@@ -69,49 +82,97 @@ sim_pira = True        # Opciones: True, False
 
 # Rangos normales (Modo Planta Sana)
 RANGES_SANA = {
-    "dht_temp": (20.0, 30.0),       
-    "dht_humidity": (50.0, 80.0),   
-    "soil_N": (20, 40),            
-    "soil_P": (15, 30),            
-    "soil_K": (50, 150),            
-    "soil_humidity": (25.0, 45.0),  
-    "soil_temp": (20.0, 35.0),      
-    "soil_ec": (200, 400),         
-    "soil_ph": (5.5, 6.5),          
+    "dht_temp": (19.0, 29.0), 
+    "dht_humidity": (45.0, 75.0), 
+    "soil_N": (15, 45),           
+    "soil_P": (18, 55),           
+    "soil_K": (45, 245),            
+    "soil_humidity": (20.0, 43.0),
+    "soil_temp": (21.0, 29.0),   
+    "soil_ec": (200, 400),        
+    "soil_ph": (6, 6.5),         
     "battery": (21.0, 100.0),       
     "piramometro_rad": (100.0, 1000.0) 
 }
 
-# Rangos intermedios (Modo Advertencia para probar sensibilidad del ML)
-RANGES_ADVERTENCIA = {
-    "dht_temp": (32, 39),       # Temperatura al límite superior
-    "dht_humidity": (32, 40),   # Humedad ambiente comenzando a bajar
-    "soil_N": (5, 10),             # Nutrientes en declive
-    "soil_P": (5, 10),
-    "soil_K": (5, 10),
-    "soil_humidity": (15, 20),  # Suelo secándose moderadamente
-    "soil_temp": (36, 38),      # Suelo calentándose
-    "soil_ec": (400, 600),          # Salinidad subiendo a niveles de precaución
-    "soil_ph": (4, 5),          # pH acidificándose levemente
-    "battery": (21.0, 100.0),       
-    "piramometro_rad": (1001.0, 1199.0) # Radiación alta pero no extrema
+# --- ANOMALÍAS GENÉRICAS ---
+RANGES_ANOMALOS_ALTA = {
+    "dht_temp": (35.0, 45.0),       
+    "dht_humidity": (85.0, 95.0),   
+    "soil_N": (60, 100),            
+    "soil_P": (45, 80),            
+    "soil_K": (200, 300),            
+    "soil_humidity": (55.0, 75.0),  
+    "soil_temp": (38.0, 45.0),      
+    "soil_ec": (500, 800),         
+    "soil_ph": (7.0, 8.5),                
+    "piramometro_rad": (1100.0, 1400.0) 
 }
 
-# Rangos anómalos (Modo Crítico para probar anomalías severas)
-RANGES_CRITICO = {
-    "dht_temp": (40.0, 45.0),       
-    "dht_humidity": (15.0, 32),   
-    "soil_N": (0, 5),              
-    "soil_P": (0, 5),
-    "soil_K": (0, 5),
-    "soil_humidity": (5.0, 10.0),  
-    "soil_temp": (39.0, 45.0),      
-    "soil_ec": (700, 1000),        
-    "soil_ph": (3, 4),          
-    "battery": (1.0, 100.0),       
-    "piramometro_rad": (1200.0, 1400.0) 
+RANGES_ANOMALOS_BAJA = {
+    "dht_temp": (5.0, 15.0),       
+    "dht_humidity": (15.0, 30.0),   
+    "soil_N": (0, 10),            
+    "soil_P": (0, 10),            
+    "soil_K": (0, 20),            
+    "soil_humidity": (5.0, 15.0),  
+    "soil_temp": (5.0, 15.0),      
+    "soil_ec": (50, 100),         
+    "soil_ph": (3.5, 4.5),                
+    "piramometro_rad": (0.0, 50.0) 
 }
 
+# --- ANOMALÍAS MIXTAS/CORRELACIONADAS ---
+RANGES_FRIO_HUMEDO = {
+    "dht_temp": (5.0, 12.0),       
+    "dht_humidity": (85.0, 98.0),   
+    "soil_temp": (10.0, 15.0),      
+    "soil_humidity": (60.0, 80.0),  
+}
+
+RANGES_CALIENTE_SECO = {
+    "dht_temp": (35.0, 45.0),       
+    "dht_humidity": (10.0, 25.0),   
+    "soil_temp": (35.0, 42.0),      
+    "soil_humidity": (5.0, 15.0),  
+}
+
+RANGES_EXCESO_FERTILIZANTE = {
+    "soil_N": (80, 120),            
+    "soil_P": (60, 90),            
+    "soil_K": (250, 350),            
+    "soil_ec": (800, 1500),         # Alta salinidad por iones de fertilizante
+    "soil_ph": (4.0, 5.0),          # Acidificación severa
+}
+
+RANGES_LAVADO_NUTRIENTES = {
+    "soil_N": (0, 5),            
+    "soil_P": (0, 5),            
+    "soil_K": (0, 10),            
+    "soil_ec": (20, 80),            # Suelo inerte, sin sales conductoras
+    "soil_ph": (7.5, 8.5),          # Tendencia a alcalinizarse
+}
+
+# MAPEO DE MODOS A SUS GRUPOS Y RANGOS
+MODOS_CONFIG = {
+    "ambiente_alta": ("ambiente", RANGES_ANOMALOS_ALTA),
+    "ambiente_baja": ("ambiente", RANGES_ANOMALOS_BAJA),
+    "ambiente_caliente_seco": ("ambiente", RANGES_CALIENTE_SECO),
+    "ambiente_frio_humedo": ("ambiente", RANGES_FRIO_HUMEDO),
+    
+    "suelo_alta": ("suelo", RANGES_ANOMALOS_ALTA),
+    "suelo_baja": ("suelo", RANGES_ANOMALOS_BAJA),
+    "suelo_caliente_seco": ("suelo", RANGES_CALIENTE_SECO),
+    "suelo_frio_humedo": ("suelo", RANGES_FRIO_HUMEDO),
+    
+    "nutrientes_alta": ("nutrientes", RANGES_ANOMALOS_ALTA),
+    "nutrientes_baja": ("nutrientes", RANGES_ANOMALOS_BAJA),
+    "nutrientes_exceso": ("nutrientes", RANGES_EXCESO_FERTILIZANTE),
+    "nutrientes_lavado": ("nutrientes", RANGES_LAVADO_NUTRIENTES),
+    
+    "radiacion_alta": ("radiacion", RANGES_ANOMALOS_ALTA),
+    "radiacion_baja": ("radiacion", RANGES_ANOMALOS_BAJA),
+}
 
 # ============================================================
 # ESTADO DE CADA NODO SIMULADO
@@ -144,16 +205,18 @@ def clamp(value, minimum, maximum):
     return max(minimum, min(value, maximum))
 
 def generar_datos(nodo_id):
-    """Genera datos según el modo actual de simulación."""
     global sim_mode, sim_pira
     
-    # Seleccionar el diccionario de rangos correcto según el estado
-    if sim_mode == "sana":
-        ranges_current = RANGES_SANA
-    elif sim_mode == "advertencia":
-        ranges_current = RANGES_ADVERTENCIA
-    else:
-        ranges_current = RANGES_CRITICO
+    current_ranges = RANGES_SANA.copy()
+
+    # Si hay una anomalía activa, buscar en el mapeo y sobreescribir los rangos
+    if sim_mode != "sana" and sim_mode in MODOS_CONFIG:
+        grupo_afectado, rangos_objetivo = MODOS_CONFIG[sim_mode]
+        sensores_del_grupo = GRUPOS_ANOMALIAS.get(grupo_afectado, [])
+        
+        for sensor in sensores_del_grupo:
+            if sensor in rangos_objetivo:
+                current_ranges[sensor] = rangos_objetivo[sensor]
 
     with state_lock:
         state = node_state[nodo_id]
@@ -171,27 +234,26 @@ def generar_datos(nodo_id):
 
     data = {
         "dht": {
-            "t": round(random.uniform(*ranges_current["dht_temp"]), 1),
-            "h": round(random.uniform(*ranges_current["dht_humidity"]), 1),
+            "t": round(random.uniform(*current_ranges["dht_temp"]), 1),
+            "h": round(random.uniform(*current_ranges["dht_humidity"]), 1),
         },
         "suelo": {
-            "N": random.randint(*ranges_current["soil_N"]),
-            "P": random.randint(*ranges_current["soil_P"]),
-            "K": random.randint(*ranges_current["soil_K"]),
-            "hum": round(random.uniform(*ranges_current["soil_humidity"]), 1),
-            "temp": round(random.uniform(*ranges_current["soil_temp"]), 1),
-            "ec": random.randint(*ranges_current["soil_ec"]),
-            "ph": round(random.uniform(*ranges_current["soil_ph"]), 2),
+            "N": random.randint(*current_ranges["soil_N"]),
+            "P": random.randint(*current_ranges["soil_P"]),
+            "K": random.randint(*current_ranges["soil_K"]),
+            "hum": round(random.uniform(*current_ranges["soil_humidity"]), 1),
+            "temp": round(random.uniform(*current_ranges["soil_temp"]), 1),
+            "ec": random.randint(*current_ranges["soil_ec"]),
+            "ph": round(random.uniform(*current_ranges["soil_ph"]), 2),
         },
         "bateria": {
             "porcentaje": battery,
         },
     }
 
-    # Condicional de hardware: Simula si el nodo tiene o no conectado el Piramómetro
     if sim_pira:
         data["piramometro"] = {
-            "rad": round(random.uniform(*ranges_current["piramometro_rad"]), 1)
+            "rad": round(random.uniform(*current_ranges["piramometro_rad"]), 1)
         }
 
     return data
@@ -295,16 +357,16 @@ def publicar_sensor(nodo_id):
     if not mqtt_connected.is_set(): return
     info = mqtt_client.publish(topic, payload, qos=0, retain=False)
     
-    # Formateo dinámico del piramómetro para impresión en consola
     pira_str = f"Rad={data['piramometro']['rad']}W/m²" if "piramometro" in data else "Rad=---"
     
     if info.rc == mqtt.MQTT_ERR_SUCCESS:
         print(f"[MQTT] {nodo_id} | T={data['dht']['t']}°C H={data['dht']['h']}% | "
               f"NPK={data['suelo']['N']}/{data['suelo']['P']}/{data['suelo']['K']} | "
-              f"HumS={data['suelo']['hum']}% pH={data['suelo']['ph']} | "
+              f"HumS={data['suelo']['hum']}% TempS={data['suelo']['temp']}°C | "
+              f"EC={data['suelo']['ec']}µS/cm pH={data['suelo']['ph']} | "
               f"Bat={data['bateria']['porcentaje']}% | {pira_str}")
 
-
+        
 # ============================================================
 # IMÁGENES HTTP
 # ============================================================
@@ -361,13 +423,30 @@ def main():
     print(f"Intervalo MQTT: {SENSOR_INTERVAL_SECONDS}s | Intervalo HTTP: {PHOTO_INTERVAL_SECONDS}s")
     print("=" * 70)
     print("COMANDOS DISPONIBLES EN CONSOLA:")
-    print("  sana        -> Entorno en parámetros normales.")
-    print("  advertencia -> Desviaciones leves (Prueba de sensibilidad ML).")
-    print("  critico     -> Anomalías severas (Prueba de alertas graves ML).")
-    print("  pira on     -> Habilita el piramómetro.")
-    print("  pira off    -> Inhabilita el piramómetro.")
-    print("  estado      -> Muestra la configuración actual de la simulación.")
-    print("  salir       -> Detener el simulador.")
+    print("  --- BASE ---")
+    print("  sana                     -> Entorno en parámetros normales.")
+    print("  --- AMBIENTE ---")
+    print("  ambiente_alta            -> Temperatura y humedad ambiente elevadas.")
+    print("  ambiente_baja            -> Temperatura y humedad ambiente bajas.")
+    print("  ambiente_caliente_seco   -> Temp Alta + Humedad Baja (Sequía).")
+    print("  ambiente_frio_humedo     -> Temp Baja + Humedad Alta (Riesgo de hongos).")
+    print("  --- SUELO ---")
+    print("  suelo_alta               -> Humedad y temperatura del suelo elevadas.")
+    print("  suelo_baja               -> Humedad y temperatura del suelo bajas.")
+    print("  suelo_caliente_seco      -> Temp Suelo Alta + Humedad Baja (Suelo árido).")
+    print("  suelo_frio_humedo        -> Temp Suelo Baja + Humedad Alta (Encharcamiento).")
+    print("  --- NUTRIENTES ---")
+    print("  nutrientes_alta          -> NPK, EC y pH por encima de lo normal.")
+    print("  nutrientes_baja          -> NPK, EC y pH por debajo de lo normal.")
+    print("  nutrientes_exceso        -> Alto NPK, alta EC, bajo pH (Toxicidad/Salinidad).")
+    print("  nutrientes_lavado        -> Bajo NPK, baja EC, alto pH (Lixiviación/Suelo inerte).")
+    print("  --- RADIACIÓN ---")
+    print("  radiacion_alta           -> Radiación solar elevada.")
+    print("  radiacion_baja           -> Radiación solar escasa.")
+    print("  --- HARDWARE ---")
+    print("  pira on / pira off       -> Habilita/Inhabilita el envío del piramómetro.")
+    print("  estado                   -> Muestra la configuración actual.")
+    print("  salir                    -> Detener el simulador.")
     print("=" * 70)
 
     if not SIMULATED_NODES: return
@@ -385,19 +464,13 @@ def main():
 
     print("\n[SIM] Simulación activa. Escribe un comando y presiona Enter...\n")
 
-    # Bucle de comandos interactivo
     try:
         while True:
             cmd = input().strip().lower()
-            if cmd == 'sana':
-                sim_mode = 'sana'
-                print("\n⚙️  [CLI] MODO CAMBIADO: 🌱 PLANTA SANA (Parámetros Normales)")
-            elif cmd == 'advertencia':
-                sim_mode = 'advertencia'
-                print("\n⚙️  [CLI] MODO CAMBIADO: ⚠️ ADVERTENCIA (Desviaciones Leves Activadas)")
-            elif cmd == 'critico':
-                sim_mode = 'critico'
-                print("\n⚙️  [CLI] MODO CAMBIADO: 🚨 CRÍTICO (Anomalías Severas Activadas)")
+            
+            if cmd == "sana" or cmd in MODOS_CONFIG:
+                sim_mode = cmd
+                print(f"\n⚙️  [CLI] MODO CAMBIADO: {cmd.upper().replace('_', ' ')}")
             elif cmd == 'pira on':
                 sim_pira = True
                 print("\n⚙️  [CLI] HARDWARE: ☀️ Piramómetro ACTIVADO")
@@ -412,7 +485,8 @@ def main():
             elif cmd == '':
                 pass
             else:
-                print(f"[CLI] Comando desconocido: '{cmd}'. Usa: sana, advertencia, critico, pira on, pira off, estado, salir") 
+                opciones_validas = ['sana'] + list(MODOS_CONFIG.keys())
+                print(f"[CLI] Comando desconocido. Opciones válidas:\n{', '.join(opciones_validas)}\nO también: pira on, pira off, estado, salir") 
                 
     except KeyboardInterrupt:
         print("\n[SIM] Interrupción manual. Deteniendo simulador...")
