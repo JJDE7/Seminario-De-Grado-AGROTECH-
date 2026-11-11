@@ -2,7 +2,7 @@
 AgroTech Dashboard + FastAPI — Compatible con Flet 0.84+
 v4.0.1 — Cambios principales:
 - Corrección de migración SQLite: Se elimina dinámicamente la columna 'payload' de BDs antiguas.
-- Algoritmo de ML (Isolation Forest) integrado para detección de anomalías.
+- Algoritmo de ML (Isolation Forest) integrado para detección de anomalías (9 Dimensiones: incl. NPK).
 - Tabla 'alertas' añadida para registrar anomalías multivariables con severidad.
 - Campo 'payload' descartado; los JSON se reconstruyen al vuelo desde la BD.
 """
@@ -342,19 +342,20 @@ def entrenar_modelo_iforest():
     """Extrae datos históricos y entrena el modelo de detección de anomalías."""
     try:
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            # CORRECCIÓN DE SINTAXIS: Se agregó "NULL" al final de la consulta SQL
             cursor = conn.execute("""
-                SELECT temperatura, humedad, humedad_suelo, temperatura_suelo, ph, conductividad
+                SELECT temperatura, humedad, humedad_suelo, temperatura_suelo, ph, conductividad, nitrogeno, fosforo, potasio
                 FROM mediciones 
                 WHERE temperatura IS NOT NULL AND humedad_suelo IS NOT NULL
             """)
             datos = cursor.fetchall()
             
         if len(datos) < 50:
-            print("[ML] Datos insuficientes para entrenar (mínimo 50 registros sanos).")
+            print(f"[ML] Datos insuficientes para entrenar ({len(datos)}). Mínimo 50 registros sanos.")
             return
 
         X = np.array(datos)
-        modelo = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
+        modelo = IsolationForest(n_estimators=100, contamination=0.035, random_state=42)
         modelo.fit(X)
         joblib.dump(modelo, MODELO_ML_PATH)
         print("[ML] Modelo Isolation Forest entrenado y guardado con éxito.")
@@ -378,17 +379,20 @@ def evaluar_anomalias(nodo_id, timestamp, registro):
         temp_s = _numero(suelo.get("temp"))
         ph = _numero(suelo.get("ph"))
         ec = _numero(suelo.get("ec"))
+        n = _numero(suelo.get("N"))
+        p = _numero(suelo.get("P"))
+        k = _numero(suelo.get("K"))
 
-        if None in [t, h, hum_s, temp_s, ph, ec]:
+        if None in [t, h, hum_s, temp_s, ph, ec, n, p, k]:
             return 
 
-        vector = np.array([[t, h, hum_s, temp_s, ph, ec]])
+        vector = np.array([[t, h, hum_s, temp_s, ph, ec, n, p, k]])
         
         prediccion = modelo.predict(vector) 
         score = float(modelo.decision_function(vector)[0]) 
 
         if prediccion[0] == -1:
-            severidad = "Crítica" if score < -0.08 else "Advertencia"
+            severidad = "Crítica" if score < -0.05 else "Advertencia"
             descripcion = f"Patrón multivariable inusual detectado. Score: {score:.3f}. Revisar condiciones de suelo y ambiente."
             
             with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
@@ -1673,6 +1677,46 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
     txt_c=ft.Text("Esperando foto del nodo via HTTP...",size=9,color=C["gris_texto"],italic=True)
 
     img_gen_mostrada = {"v": -1}
+    
+    # Contenedor persistente para las alertas
+    contenedor_alertas = ft.Column(spacing=6, expand=True, scroll=ft.ScrollMode.AUTO)
+
+    def actualizar_vista_alertas():
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            alertas_db = conn.execute("""
+                SELECT timestamp, tipo, puntuacion, severidad, descripcion, estado 
+                FROM alertas WHERE nodo_id = ? ORDER BY id DESC LIMIT 20
+            """, (nodo_id,)).fetchall()
+
+        if not alertas_db:
+            contenedor_alertas.controls = [
+                ft.Container(expand=True, alignment=ft.Alignment(0,0),
+                    content=ft.Text("Plantas Sanas. Ninguna anomalía detectada.", color=C["gris_texto"]))
+            ]
+        else:
+            columnas = []
+            for al in alertas_db:
+                color_icono = C["rojo"] if al[3] == "Crítica" else C["amarillo"]
+                icono = ft.Icons.WARNING if al[3] == "Crítica" else ft.Icons.ERROR_OUTLINE
+                
+                columnas.append(
+                    ft.Container(
+                        border_radius=8, bgcolor=C["blanco"], border=ft.Border.all(1, C["gris_borde"]),
+                        padding=ft.Padding.all(10),
+                        content=ft.Row([
+                            ft.Icon(icono, color=color_icono, size=24),
+                            ft.Column([
+                                ft.Row([
+                                    ft.Text(al[3].upper(), size=10, weight=ft.FontWeight.BOLD, color=color_icono),
+                                    ft.Text(al[0], size=9, color=C["gris_texto"]),
+                                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, expand=True),
+                                ft.Text(al[4], size=11, color=C["negro_texto"]),
+                                ft.Text(f"Tipo: {al[1]} | Score ML: {al[2]:.3f} | Estado: {al[5]}", size=9, color=C["gris_texto"])
+                            ], spacing=2, expand=True)
+                        ])
+                    )
+                )
+            contenedor_alertas.controls = columnas
 
     def actualizar():
         d=estado_nodos[nodo_id]["dht"]; vt.value=d["t"]; vh.value=d["h"]
@@ -1697,13 +1741,11 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                     txt_c.value  = f"Última foto: {hora_img}" if hora_img else "Foto recibida"
                     txt_c.italic = False
 
-        # --- CAMBIO AÑADIDO: Actualización al vuelo de alertas ML ---
         try:
             if vista_actual.get("v") == 3:
-                vistas[3].content.controls[2] = construir_vista_alertas()
-        except (NameError, KeyError, IndexError):
-            pass # Previene errores en la llamada inicial cuando las vistas aún no existen
-        # ------------------------------------------------------------
+                actualizar_vista_alertas()
+        except Exception:
+            pass 
 
         try:
             page.update()
@@ -1778,48 +1820,12 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
             sensor_card("Radiación Solar","W/m²",vRAD,ft.Icons.LIGHT_MODE,C["amarillo"]),
         ], spacing=4, expand=True))
 
-    # Nueva Vista de Alertas ML
-    def construir_vista_alertas():
-        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-            alertas_db = conn.execute("""
-                SELECT timestamp, tipo, puntuacion, severidad, descripcion, estado 
-                FROM alertas WHERE nodo_id = ? ORDER BY id DESC LIMIT 20
-            """, (nodo_id,)).fetchall()
-
-        if not alertas_db:
-            return ft.Container(expand=True, alignment=ft.Alignment(0,0),
-                content=ft.Text("Plantas Sanas. Ninguna anomalía detectada.", color=C["gris_texto"]))
-            
-        columnas = []
-        for al in alertas_db:
-            color_icono = C["rojo"] if al[3] == "Crítica" else C["amarillo"]
-            icono = ft.Icons.WARNING if al[3] == "Crítica" else ft.Icons.ERROR_OUTLINE
-            
-            columnas.append(
-                ft.Container(
-                    border_radius=8, bgcolor=C["blanco"], border=ft.Border.all(1, C["gris_borde"]),
-                    padding=ft.Padding.all(10),
-                    content=ft.Row([
-                        ft.Icon(icono, color=color_icono, size=24),
-                        ft.Column([
-                            ft.Row([
-                                ft.Text(al[3].upper(), size=10, weight=ft.FontWeight.BOLD, color=color_icono),
-                                ft.Text(al[0], size=9, color=C["gris_texto"]),
-                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, expand=True),
-                            ft.Text(al[4], size=11, color=C["negro_texto"]),
-                            ft.Text(f"Tipo: {al[1]} | Score ML: {al[2]:.3f} | Estado: {al[5]}", size=9, color=C["gris_texto"])
-                        ], spacing=2, expand=True)
-                    ])
-                )
-            )
-        return ft.Column(columnas, spacing=6, expand=True, scroll=ft.ScrollMode.AUTO)
-
     vista_alertas = ft.Container(border_radius=12, bgcolor=C["fondo"],
         border=ft.Border.all(1, C["rojo"]), padding=ft.Padding.all(8),
         content=ft.Column([
             sec_header(ft.Icons.NOTIFICATION_IMPORTANT, "Alertas ML", "Isolation Forest - Detección de Anomalías", C["rojo"]),
             ft.Divider(color=C["rojo"], height=1),
-            construir_vista_alertas()
+            contenedor_alertas
         ], spacing=4, expand=True))
 
     vista_camara = ft.Container(border_radius=12,bgcolor=C["cafe_suave"],
@@ -1845,9 +1851,8 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
 
     def cambiar_vista(nueva_vista):
         vista_actual["v"] = nueva_vista
-        # Al cambiar a alertas, obligar a refrescar la base de datos visual
         if nueva_vista == 3:
-            vistas[3].content.controls[2] = construir_vista_alertas()
+            actualizar_vista_alertas()
         contenedor_vistas.content = vistas[nueva_vista]
         actualizar_botones_nav()
         page.update()
