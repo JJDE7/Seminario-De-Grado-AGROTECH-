@@ -7,12 +7,27 @@ v3.2 — Cambios principales:
 - Historial paginado (10 registros por página)
 - NUEVO: Recepción de fotografías por HTTP (reemplaza MQTT+Base64).
   MQTT se conserva para sensores, status y configuración de horario.
+
+v12 - CORRECCIONES (firmware nodo2_esp32s3_v12.ino):
+  1) mqtt_publicar_config() ahora publica con qos=1 y retain=True y espera
+     confirmación real del broker (wait_for_publish). Antes el cliente
+     temporal hacía publish()+disconnect() sin loop de red, así que el
+     mensaje podía no salir nunca y la UI igual decía "enviada".
+     Con retain, el broker guarda el horario y se lo entrega al ESP32
+     apenas despierta y se suscribe (el nodo duerme casi todo el tiempo).
+  2) La configuración va al tópico por nodo: esp32/<nodo_id>/config.
+  3) La app se suscribe a esp32/<nodo_id>/configok y /status para saber
+     si el nodo realmente recibió y guardó el horario, y lo muestra en
+     la pantalla de configuración.
 """
 
 import flet as ft
 import paho.mqtt.client as mqtt
 import json
+import sqlite3
+import asyncio
 import threading
+import time          # v12: espera de la confirmacion del nodo
 import base64
 import urllib.request
 import os
@@ -21,24 +36,44 @@ from typing import Optional
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+try:
+    import websockets
+except ImportError:
+    websockets = None
+
 # ══════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════════
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
 
+# NOTA: esta app se conecta al broker por "localhost" porque corre en la
+# misma PC donde vive el broker. El ESP32-CAM, en cambio, se conecta por
+# la IP LAN de esta PC (10.226.6.61 en el firmware). Si el ESP32 no logra
+# conectar por MQTT aunque el WiFi sí conecte, revisa que el broker
+# (ej. Mosquitto) tenga un listener en 0.0.0.0 y no solo en 127.0.0.1,
+# y que el firewall de esta PC permita el puerto 1883 entrante.
+
 # NUEVO: servidor HTTP que recibe las fotos enviadas por la ESP32-S3 CAM.
 # Debe coincidir con PHOTO_SERVER_URL configurado en el firmware del nodo.
 HTTP_PHOTO_PORT = 8080
 HTTP_PHOTO_PATH = "/upload"
 
+# NUEVO: almacenamiento histórico completo en SQLite.
+# JSON se conserva como respaldo y para que la interfaz Flet siga funcionando.
+SQLITE_DB = os.path.join(os.path.expanduser("~/agrotech/data"), "agrotech.db")
+
+# NUEVO: servidor WebSocket para clientes externos (HTML, otras apps, etc.).
+WEBSOCKET_HOST = "0.0.0.0"
+WEBSOCKET_PORT = 8765
+
 DATA_DIR    = os.path.expanduser("~/agrotech/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 NODOS = [
-    {"id":"nodo1","nombre":"Nodo 1 · Parcela A","topic":"esp32/nodo1/data","camera_ip":"192.168.137.20","activo":True},
-    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":"192.168.137.20","activo":True},
-    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":"192.168.137.20","activo":True},
+    {"id":"nodo1","nombre":"Nodo 1 · Parcela A","topic":"esp32/nodo1/data","camera_ip":"10.0.0.60","activo":True},
+    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":"10.0.0.61","activo":True},
+    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":None,"activo":False}, #Aqui se desactivo manualmente el nodo
     {"id":"nodo4","nombre":"Nodo 4 · Reserva","topic":"esp32/nodo4/data","camera_ip":None,"activo":False},   #Aqui se desactivo manualmente el nodo
 ]
 
@@ -54,6 +89,307 @@ C = {
     "blanco":"#FFFFFF","gris_texto":"#757575","gris_borde":"#E0E0E0","negro_texto":"#212121",
     "rojo":"#C62828","amarillo":"#F57F17","amarillo_suave":"#FFFDE7","amarillo_borde":"#FFE082",
 }
+
+# ══════════════════════════════════════════════════════════════════════
+#  SQLITE — ALMACENAMIENTO HISTÓRICO
+# ══════════════════════════════════════════════════════════════════════
+def sqlite_iniciar():
+    """Crea la base de datos y la tabla de mediciones si no existen."""
+    try:
+        os.makedirs(os.path.dirname(SQLITE_DB), exist_ok=True)
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS mediciones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nodo_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    temperatura REAL,
+                    humedad REAL,
+                    nitrogeno REAL,
+                    fosforo REAL,
+                    potasio REAL,
+                    humedad_suelo REAL,
+                    temperatura_suelo REAL,
+                    conductividad REAL,
+                    ph REAL,
+                    bateria REAL,
+                    payload TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mediciones_nodo_fecha
+                ON mediciones(nodo_id, timestamp)
+            """)
+            conn.commit()
+        print(f"[SQLITE] Base de datos lista: {SQLITE_DB}")
+        return True
+    except Exception as e:
+        print(f"[SQLITE] Error inicializando: {e}")
+        return False
+
+
+def _numero(valor):
+    try:
+        return float(valor) if isinstance(valor, (int, float)) else None
+    except Exception:
+        return None
+
+
+def guardar_sqlite(nodo_id, dato, timestamp):
+    """Guarda una medición completa en SQLite sin alterar el JSON existente."""
+    try:
+        dht = dato.get("dht", {})
+        suelo = dato.get("suelo", {})
+        bateria = dato.get("bateria", {})
+
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            conn.execute("""
+                INSERT INTO mediciones (
+                    nodo_id, timestamp, temperatura, humedad,
+                    nitrogeno, fosforo, potasio,
+                    humedad_suelo, temperatura_suelo, conductividad,
+                    ph, bateria, payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                nodo_id,
+                timestamp,
+                _numero(dht.get("t")),
+                _numero(dht.get("h")),
+                _numero(suelo.get("N")),
+                _numero(suelo.get("P")),
+                _numero(suelo.get("K")),
+                _numero(suelo.get("hum")),
+                _numero(suelo.get("temp")),
+                _numero(suelo.get("ec")),
+                _numero(suelo.get("ph")),
+                _numero(bateria.get("porcentaje")),
+                json.dumps(dato, ensure_ascii=False),
+            ))
+            conn.commit()
+    except Exception as e:
+        print(f"[SQLITE] Error guardando medición de {nodo_id}: {e}")
+
+
+def sqlite_ultimo(nodo_id):
+    """Obtiene la última medición de un nodo para consultas WebSocket."""
+    try:
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            row = conn.execute("""
+                SELECT timestamp, payload
+                FROM mediciones
+                WHERE nodo_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+            """, (nodo_id,)).fetchone()
+        if not row:
+            return None
+        dato = json.loads(row[1])
+        return {
+            "tipo": "lectura",
+            "nodo_id": nodo_id,
+            "timestamp": row[0],
+            **dato,
+        }
+    except Exception as e:
+        print(f"[SQLITE] Error consultando último dato: {e}")
+        return None
+
+
+def sqlite_historial(nodo_id, limite=100):
+    """Obtiene historial desde SQLite, sin depender del límite de 500 del JSON."""
+    try:
+        limite = max(1, min(int(limite), 5000))
+    except (TypeError, ValueError):
+        limite = 100
+
+    try:
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            rows = conn.execute("""
+                SELECT timestamp, payload
+                FROM mediciones
+                WHERE nodo_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """, (nodo_id, limite)).fetchall()
+
+        resultado = []
+        for timestamp, payload in rows:
+            dato = json.loads(payload)
+            resultado.append({
+                "timestamp": timestamp,
+                **dato,
+            })
+        return resultado
+    except Exception as e:
+        print(f"[SQLITE] Error consultando historial: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  WEBSOCKET — SERVIDOR PARA CLIENTES EXTERNOS
+# ══════════════════════════════════════════════════════════════════════
+_ws_loop = None
+_ws_thread = None
+_ws_clients = set()
+_ws_ready = threading.Event()
+
+
+def _websocket_payload_lectura(nodo_id, dato, timestamp):
+    return {
+        "tipo": "lectura",
+        "nodo_id": nodo_id,
+        "timestamp": timestamp,
+        **dato,
+    }
+
+
+def _websocket_payload_foto(nodo_id, img_bytes, timestamp, tam_kb):
+    return {
+        "tipo": "foto",
+        "nodo_id": nodo_id,
+        "timestamp": timestamp,
+        "tam_kb": tam_kb,
+        "imagen_b64": base64.b64encode(img_bytes).decode("utf-8"),
+    }
+
+
+async def _ws_handler(websocket, *args):
+    """Atiende clientes externos y consultas de último dato/historial."""
+    _ws_clients.add(websocket)
+    try:
+        await websocket.send(json.dumps({
+            "tipo": "conexion",
+            "estado": "conectado",
+            "servidor": "AgroTech",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }, ensure_ascii=False))
+
+        # Entrega el último estado disponible de los nodos al conectar.
+        for nodo in NODOS:
+            if nodo["activo"]:
+                ultimo = sqlite_ultimo(nodo["id"])
+                if ultimo:
+                    await websocket.send(json.dumps(ultimo, ensure_ascii=False))
+
+        async for mensaje in websocket:
+            try:
+                solicitud = json.loads(mensaje)
+            except Exception:
+                await websocket.send(json.dumps({
+                    "tipo": "error",
+                    "mensaje": "La solicitud no es JSON válido."
+                }, ensure_ascii=False))
+                continue
+
+            if solicitud.get("tipo") != "consulta":
+                await websocket.send(json.dumps({
+                    "tipo": "error",
+                    "mensaje": "Tipo de solicitud no soportado."
+                }, ensure_ascii=False))
+                continue
+
+            accion = solicitud.get("accion")
+            nodo_id = solicitud.get("nodo") or solicitud.get("nodo_id")
+
+            if not nodo_id:
+                await websocket.send(json.dumps({
+                    "tipo": "error",
+                    "mensaje": "Falta el nodo."
+                }, ensure_ascii=False))
+                continue
+
+            if accion == "ultimo":
+                dato = sqlite_ultimo(nodo_id)
+                respuesta = dato or {
+                    "tipo": "respuesta",
+                    "accion": "ultimo",
+                    "nodo_id": nodo_id,
+                    "datos": None,
+                }
+                await websocket.send(json.dumps(respuesta, ensure_ascii=False))
+
+            elif accion == "historial":
+                historial = sqlite_historial(
+                    nodo_id,
+                    solicitud.get("limite", 100)
+                )
+                await websocket.send(json.dumps({
+                    "tipo": "historial",
+                    "nodo_id": nodo_id,
+                    "cantidad": len(historial),
+                    "datos": historial,
+                }, ensure_ascii=False))
+
+            else:
+                await websocket.send(json.dumps({
+                    "tipo": "error",
+                    "mensaje": f"Acción no soportada: {accion}"
+                }, ensure_ascii=False))
+    except Exception as e:
+        print(f"[WS] Cliente desconectado: {e}")
+    finally:
+        _ws_clients.discard(websocket)
+
+
+async def _ws_broadcast(payload):
+    if not _ws_clients:
+        return
+
+    mensaje = json.dumps(payload, ensure_ascii=False)
+    clientes = list(_ws_clients)
+    resultados = await asyncio.gather(
+        *(cliente.send(mensaje) for cliente in clientes),
+        return_exceptions=True
+    )
+
+    for cliente, resultado in zip(clientes, resultados):
+        if isinstance(resultado, Exception):
+            _ws_clients.discard(cliente)
+
+
+async def _ws_main():
+    async with websockets.serve(_ws_handler, WEBSOCKET_HOST, WEBSOCKET_PORT):
+        print(f"[WS] Servidor WebSocket escuchando en ws://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}")
+        _ws_ready.set()
+        await asyncio.Future()
+
+
+def websocket_broadcast(payload):
+    """Envía un mensaje desde MQTT/HTTP hacia el hilo asyncio del WebSocket."""
+    if _ws_loop and _ws_loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _ws_broadcast(payload),
+                _ws_loop
+            )
+        except Exception as e:
+            print(f"[WS] Error programando broadcast: {e}")
+
+
+def websocket_iniciar():
+    """Levanta el servidor WebSocket en un hilo separado para no bloquear Flet/MQTT."""
+    global _ws_loop, _ws_thread
+
+    if websockets is None:
+        print("[WS] ERROR: falta instalar la librería 'websockets'.")
+        print("[WS] Instala con: pip install websockets")
+        return False
+
+    def _run():
+        global _ws_loop
+        try:
+            _ws_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_ws_loop)
+            _ws_loop.run_until_complete(_ws_main())
+        except Exception as e:
+            print(f"[WS] No se pudo iniciar: {e}")
+
+    _ws_thread = threading.Thread(target=_run, daemon=True)
+    _ws_thread.start()
+    _ws_ready.wait(timeout=3)
+    return _ws_ready.is_set()
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  PERSISTENCIA DE DATOS
@@ -73,15 +409,18 @@ def guardar_dato(nodo_id, dato):
                 historial = json.load(f)
         else:
             historial = []
-        dato["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not dato.get("timestamp"):
+            dato["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         historial.append(dato)
         # Guardar máximo 500 registros por nodo
         if len(historial) > 500:
             historial = historial[-500:]
         with open(ruta, "w") as f:
             json.dump(historial, f, indent=2)
+        return dato.get("timestamp")
     except Exception as e:
         print(f"[DATA] Error guardando: {e}")
+        return None
 
 def cargar_historial(nodo_id):
     """Carga el historial de un nodo desde disco."""
@@ -221,6 +560,10 @@ for nodo in NODOS:
         }
 
 estado_mqtt = {"conectado": False}
+# v12: última confirmación recibida de cada nodo (tópico esp32/<id>/configok)
+# y último status ("hola", "chao", "config_on", "config_off").
+estado_config_ack = {}
+estado_status_nodo = {}
 _mqtt_client: Optional[mqtt.Client] = None
 _camara_activa = threading.Event()
 
@@ -267,6 +610,13 @@ def mqtt_iniciar_global(on_update):
             for topic in topic_to_nodo.keys():
                 client.subscribe(topic)
                 print(f"[MQTT] Suscrito a {topic}")
+            # v12: además del tópico de datos, escuchamos la confirmación de
+            # horario y el status de cada nodo activo.
+            for nodo in NODOS:
+                if nodo["activo"]:
+                    client.subscribe(f'esp32/{nodo["id"]}/configok')
+                    client.subscribe(f'esp32/{nodo["id"]}/status')
+                    print(f'[MQTT] Suscrito a esp32/{nodo["id"]}/configok y /status')
             # NOTA: ya NO nos suscribimos a cam/start, cam/data, cam/end.
             # Las fotos ahora llegan por HTTP (ver http_photo_server_iniciar()),
             # no por MQTT+Base64.
@@ -281,13 +631,40 @@ def mqtt_iniciar_global(on_update):
     def _on_message(client, userdata, msg):
         """Procesa mensajes de datos de cualquier nodo (sensores/status)."""
         try:
+            texto = msg.payload.decode("utf-8", errors="ignore")
+
+            # ── v12: confirmación de horario enviada por el ESP32 ──
+            if msg.topic.endswith("/configok"):
+                nid = msg.topic.split("/")[1]
+                try:
+                    ack = json.loads(texto)
+                except Exception:
+                    ack = {"raw": texto}
+                ack["recibido"] = datetime.now().strftime("%H:%M:%S")
+                estado_config_ack[nid] = ack
+                print(f"[MQTT] CONFIRMACION de {nid}: {texto}")
+                notificar_actualizacion()
+                on_update()
+                return
+
+            # ── v12: status del nodo (hola / chao / config_on / config_off) ──
+            if msg.topic.endswith("/status"):
+                nid = msg.topic.split("/")[1]
+                estado_status_nodo[nid] = {
+                    "valor": texto,
+                    "hora": datetime.now().strftime("%H:%M:%S"),
+                }
+                print(f"[MQTT] status {nid}: {texto}")
+                return
+
             # Identificar de qué nodo viene el mensaje
             nodo_id = topic_to_nodo.get(msg.topic)
             if not nodo_id:
                 return  # Topic desconocido
 
-            data = json.loads(msg.payload.decode("utf-8"))
+            data = json.loads(texto)
             registro = {}
+            timestamp_medicion = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             # Actualizar estado del nodo correspondiente
             if "dht" in data:
@@ -319,8 +696,22 @@ def mqtt_iniciar_global(on_update):
 
             # Guardar en historial si hay datos
             if registro:
+                registro["timestamp"] = timestamp_medicion
+
+                # Se conservan las dos persistencias:
+                # 1) JSON existente para la interfaz Flet
+                # 2) SQLite para historial completo y consultas externas
                 guardar_dato(nodo_id, registro)
+                guardar_sqlite(nodo_id, registro, timestamp_medicion)
+
                 estado_nodos[nodo_id]["ultima_actualizacion"] = datetime.now()
+
+                # Comunicación externa por WebSocket
+                websocket_broadcast(
+                    _websocket_payload_lectura(
+                        nodo_id, registro, timestamp_medicion
+                    )
+                )
 
             # Notificar a todos los callbacks registrados
             notificar_actualizacion()
@@ -348,22 +739,89 @@ def mqtt_detener():
         _mqtt_client = None
     estado_mqtt["conectado"] = False
 
-def mqtt_publicar_config(payload: str) -> bool:
-    """Publica configuración al topic esp32/config. (Sin cambios: sigue siendo MQTT)."""
+def mqtt_publicar_config(payload: str, nodo_id: str = "nodo2") -> bool:
+    """Publica la configuración de horario para un nodo concreto.
+
+    v12 - qué cambió y por qué:
+      * Tópico por nodo: esp32/<nodo_id>/config (antes era el global
+        esp32/config, que le llegaba a todos los nodos por igual).
+        El firmware v12 se suscribe a ambos, así que hay compatibilidad.
+      * retain=True: el ESP32 pasa casi todo el tiempo en deep sleep. Un
+        mensaje normal QoS 0 se pierde si nadie está suscrito en ese
+        instante. Con retain, el broker guarda el último horario y se lo
+        entrega al nodo en cuanto despierta y se suscribe.
+      * loop_start() + wait_for_publish(): paho solo ENCOLA en publish().
+        Sin loop de red, el disconnect() inmediato del cliente temporal
+        cortaba la conexión antes de que el paquete saliera, y la función
+        devolvía True igual. Por eso la UI decía "enviada" sin enviar nada.
+    """
     global _mqtt_client
+    topic = f"esp32/{nodo_id}/config"
     try:
         if _mqtt_client and _mqtt_client.is_connected():
-            _mqtt_client.publish("esp32/config", payload)
-            return True
-        else:
-            # Conexión temporal solo para publicar
-            tmp = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            tmp.connect(MQTT_BROKER, MQTT_PORT)
-            tmp.publish("esp32/config", payload)
-            tmp.disconnect()
-            return True
+            info = _mqtt_client.publish(topic, payload, qos=1, retain=True)
+            info.wait_for_publish(timeout=5)
+            ok = info.is_published()
+            print(f"[CONFIG] Publicado en {topic}: {payload} -> {ok}")
+            return ok
+
+        # Conexión temporal, esta vez con loop de red activo
+        tmp = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        tmp.connect(MQTT_BROKER, MQTT_PORT, keepalive=10)
+        tmp.loop_start()
+        info = tmp.publish(topic, payload, qos=1, retain=True)
+        info.wait_for_publish(timeout=5)
+        ok = info.is_published()
+        tmp.loop_stop()
+        tmp.disconnect()
+        print(f"[CONFIG] Publicado (cliente temporal) en {topic}: {payload} -> {ok}")
+        return ok
     except Exception as e:
         print(f"[CONFIG] Error publicando: {e}")
+        return False
+
+
+def mqtt_publicar_hora(nodo_id: str = "nodo2") -> bool:
+    """v13: publica la hora actual de la PC en esp32/<nodo_id>/time.
+
+    IMPORTANTE: SIN retain. Antes la fecha viajaba dentro del horario
+    retenido; el broker se la reenviaba al ESP32 en cada despertar y el
+    firmware reajustaba el DS3231 a esa fecha VIEJA, por eso el nodo nunca
+    llegaba a la hora programada. Este mensaje solo lo recibe un nodo que
+    esté despierto (modo config); si está dormido se pierde, y está bien.
+    """
+    global _mqtt_client
+    topic = f"esp32/{nodo_id}/time"
+    payload = json.dumps({"fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    try:
+        if _mqtt_client and _mqtt_client.is_connected():
+            info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
+            info.wait_for_publish(timeout=5)
+            print(f"[CONFIG] Hora publicada en {topic}: {payload}")
+            return info.is_published()
+        return False
+    except Exception as e:
+        print(f"[CONFIG] Error publicando hora: {e}")
+        return False
+
+
+def mqtt_borrar_config_retenida(nodo_id: str = "nodo2") -> bool:
+    """Borra el mensaje retenido de configuración de un nodo.
+
+    Útil si quieres que el ESP32 deje de recibir el horario viejo al
+    despertar: se publica un payload vacío con retain=True, que es la forma
+    que define MQTT para eliminar un retenido.
+    """
+    global _mqtt_client
+    topic = f"esp32/{nodo_id}/config"
+    try:
+        if _mqtt_client and _mqtt_client.is_connected():
+            _mqtt_client.publish(topic, "", qos=1, retain=True)
+            print(f"[CONFIG] Retenido borrado en {topic}")
+            return True
+        return False
+    except Exception as e:
+        print(f"[CONFIG] Error borrando retenido: {e}")
         return False
 
 # ══════════════════════════════════════════════════════════════════════
@@ -458,6 +916,16 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
             print("[CAM] Imagen mostrada en dashboard activo")
         else:
             print(f"[CAM] Imagen guardada en estado_nodos[{nodo_id}] (dashboard cerrado o es otro nodo)")
+
+        # Comunicación externa: enviar la foto por WebSocket.
+        websocket_broadcast(
+            _websocket_payload_foto(
+                nodo_id,
+                img_bytes,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                tam_kb
+            )
+        )
 
         # Notificar callbacks para que cualquier vista activa reaccione
         notificar_actualizacion()
@@ -971,7 +1439,7 @@ def build_config(nodo, page, on_volver):
     # Esto conserva el rendimiento de ListView sin dejar una tarjeta
     # ocupando todo el ancho de la pantalla.
     # 6 columnas dan una distribución compacta y estable en escritorio.
-    COLUMNAS_POR_FILA = 10
+    COLUMNAS_POR_FILA = 6
 
     dropdowns_container = ft.Column(
         spacing=8,
@@ -1332,6 +1800,45 @@ def build_config(nodo, page, on_volver):
         weight=ft.FontWeight.W_600,
         visible=False)
 
+    # v12: línea de estado de la confirmación del nodo
+    txt_ack = ft.Text(
+        "",
+        size=9,
+        italic=True,
+        color=C["gris_texto"])
+
+    def _esperar_confirmacion(nid, timeout=12):
+        """Espera (en un hilo) el ACK del nodo y actualiza txt_ack."""
+        txt_ack.value = "Esperando confirmacion del nodo..."
+        txt_ack.color = C["gris_texto"]
+
+        def _run():
+            fin = time.time() + timeout
+            while time.time() < fin:
+                ack = estado_config_ack.get(nid)
+                if ack:
+                    horarios_ack = ack.get("horarios", [])
+                    txt_ack.value = (
+                        f'Nodo confirmo ({ack.get("recibido","")}): '
+                        f'{", ".join(horarios_ack) if horarios_ack else "OK"}')
+                    txt_ack.color = C["verde"]
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(0.3)
+            txt_ack.value = (
+                "Sin confirmacion: el nodo probablemente esta dormido. "
+                "El horario quedo retenido y lo recibira al despertar.")
+            txt_ack.color = C["naranja"]
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def enviar(e):
         if not validar_horarios():
             estado_error.value = (
@@ -1355,14 +1862,25 @@ def build_config(nodo, page, on_volver):
         # "horas" mantiene la clave anterior y "minutos" aporta la
         # precisión nueva. No hace falta enviar "horarios" porque el
         # ESP32 puede reconstruir HH:MM a partir de ambas listas.
+        #
+        # NUEVO: "fecha" manda la hora actual de esta PC (formato
+        # "YYYY-MM-DD HH:MM:SS") para que el ESP32 sincronice su RTC
+        # DS1307 cada vez que se envía una configuración. Antes el RTC
+        # nunca se ajustaba desde aquí, así que podía quedar
+        # desincronizado respecto al reloj de la interfaz.
         horas_payload = [int(h.split(":")[0]) for h in horarios]
         minutos_payload = [int(h.split(":")[1]) for h in horarios]
+        # v13: el horario (retenido) ya NO lleva "fecha". La hora se manda
+        # aparte, sin retain, con mqtt_publicar_hora().
         payload = json.dumps({
             "horas": horas_payload,
             "minutos": minutos_payload,
         })
 
-        ok = mqtt_publicar_config(payload)
+        # v12: limpio la confirmación anterior y publico al tópico del nodo
+        estado_config_ack.pop(nodo_id, None)
+        ok = mqtt_publicar_config(payload, nodo_id)
+        mqtt_publicar_hora(nodo_id)   # v13: sincroniza el DS3231 si el nodo esta en modo config
         if ok:
             guardar_config_nodo(nodo_id, horarios)
 
@@ -1380,15 +1898,22 @@ def build_config(nodo, page, on_volver):
                         weight=ft.FontWeight.BOLD,
                         color=C["verde"]),
                     ft.Text(
-                        f'esp32/config: {payload}',
+                        f'esp32/{nodo_id}/config (retain): {payload}',
                         size=8,
                         color=C["gris_texto"]),
                     ft.Text(
                         f'Horarios: {", ".join(horarios)}',
                         size=9,
                         color=C["negro_texto"]),
+                    txt_ack,
                 ], spacing=1),
             ], spacing=8)
+
+            # v12: espero en segundo plano la confirmación del ESP32.
+            # El nodo responde en esp32/<id>/configok con el horario que
+            # realmente guardó. Si no responde, casi seguro está dormido:
+            # el mensaje quedó retenido y lo recibirá al despertar.
+            _esperar_confirmacion(nodo_id)
 
             estado_txt.value = (
                 f'Horario activo: {len(horarios)} medidas/dia  -  '
@@ -1745,7 +2270,13 @@ def main(page: ft.Page):
 
     mqtt_iniciar_global(global_update)
 
-    # NUEVO: iniciar servidor HTTP de fotos (reemplaza MQTT+Base64 para cámara)
+    # Persistencia nueva: SQLite conserva todo el historial de mediciones.
+    sqlite_iniciar()
+
+    # Comunicación externa: WebSocket para HTML y otros clientes.
+    websocket_iniciar()
+
+    # Servidor HTTP de fotos del ESP32-S3 CAM.
     http_photo_server_iniciar()
 
     def mostrar_inicio():
@@ -1764,7 +2295,7 @@ def main(page: ft.Page):
             on_historico=lambda: mostrar_historico(nodo))
         page.update()
 
-    def mostrar_config(nodo):
+    def mostrar_config(nodo):   
         camara_detener()
         cont.content = build_config(
             nodo=nodo, page=page,
