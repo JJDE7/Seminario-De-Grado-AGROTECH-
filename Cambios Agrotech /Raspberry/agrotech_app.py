@@ -1,11 +1,10 @@
 """
 AgroTech Dashboard + FastAPI — Compatible con Flet 0.84+
-v3.4 — Cambios principales:
-- Añadida compatibilidad completa con Piramómetro (Radiación Solar).
-- Interfaz web HTML local removida a petición del usuario.
-- API REST (/api/...) conservada para integración con la nube o aplicaciones externas.
-- Modificado esquema de base de datos SQLite para almacenar 'radiacion'.
-- Interfaz gráfica actualizada con ventana exclusiva para el Piramómetro.
+v4.0.1 — Cambios principales:
+- Corrección de migración SQLite: Se elimina dinámicamente la columna 'payload' de BDs antiguas.
+- Algoritmo de ML (Isolation Forest) integrado para detección de anomalías.
+- Tabla 'alertas' añadida para registrar anomalías multivariables con severidad.
+- Campo 'payload' descartado; los JSON se reconstruyen al vuelo desde la BD.
 """
 
 import flet as ft
@@ -18,6 +17,9 @@ import base64
 import urllib.request
 import requests
 import os
+import numpy as np
+import joblib
+from sklearn.ensemble import IsolationForest
 from datetime import datetime
 from typing import Optional
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +59,8 @@ DEFAULT_MAX_STORAGE_MB = 512
 DEFAULT_DELETE_COUNT = 100
 os.makedirs(DATA_DIR, exist_ok=True)
 
+MODELO_ML_PATH = os.path.join(DATA_DIR, "iforest_model.joblib")
+
 
 def cargar_config_almacenamiento():
     cfg = {"max_mb": DEFAULT_MAX_STORAGE_MB, "eliminar_cantidad": DEFAULT_DELETE_COUNT}
@@ -92,7 +96,7 @@ def _tamano_directorio(ruta):
 def estado_almacenamiento():
     cfg = cargar_config_almacenamiento()
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-        datos = conn.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)),0) FROM mediciones").fetchone()
+        datos = conn.execute("SELECT COUNT(*), 0 FROM mediciones").fetchone()
         fotos = conn.execute("SELECT COUNT(*), COALESCE(SUM(tam_bytes),0) FROM fotos").fetchone()
     return {"carpeta": AGROTECH_DIR, "total_bytes": _tamano_directorio(AGROTECH_DIR),
             "datos_cantidad": datos[0], "datos_payload_bytes": datos[1],
@@ -171,17 +175,45 @@ def sqlite_iniciar():
     try:
         os.makedirs(os.path.dirname(SQLITE_DB), exist_ok=True)
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            # 1. Crear tabla con la estructura limpia
             conn.execute("""CREATE TABLE IF NOT EXISTS mediciones (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, nodo_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL, temperatura REAL, humedad REAL,
                 nitrogeno REAL, fosforo REAL, potasio REAL, humedad_suelo REAL,
                 temperatura_suelo REAL, conductividad REAL, ph REAL, bateria REAL,
-                radiacion REAL,
-                payload TEXT NOT NULL, enviado INTEGER NOT NULL DEFAULT 0)""")
+                radiacion REAL, enviado INTEGER NOT NULL DEFAULT 0)""")
             
+            # 1.5 Migración automática si la tabla antigua existe con 'payload'
             cols_med = {r[1] for r in conn.execute("PRAGMA table_info(mediciones)").fetchall()}
-            if "radiacion" not in cols_med:
-                conn.execute("ALTER TABLE mediciones ADD COLUMN radiacion REAL")
+            if "payload" in cols_med:
+                print("[SQLITE] Migrando tabla 'mediciones' para eliminar la restricción de 'payload'...")
+                conn.execute("ALTER TABLE mediciones RENAME TO mediciones_old")
+                conn.execute("""CREATE TABLE mediciones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, nodo_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL, temperatura REAL, humedad REAL,
+                    nitrogeno REAL, fosforo REAL, potasio REAL, humedad_suelo REAL,
+                    temperatura_suelo REAL, conductividad REAL, ph REAL, bateria REAL,
+                    radiacion REAL, enviado INTEGER NOT NULL DEFAULT 0)""")
+                conn.execute("""INSERT INTO mediciones 
+                    (id, nodo_id, timestamp, temperatura, humedad, nitrogeno, fosforo, potasio, 
+                    humedad_suelo, temperatura_suelo, conductividad, ph, bateria, radiacion, enviado)
+                    SELECT id, nodo_id, timestamp, temperatura, humedad, nitrogeno, fosforo, potasio, 
+                    humedad_suelo, temperatura_suelo, conductividad, ph, bateria, radiacion, enviado 
+                    FROM mediciones_old""")
+                conn.execute("DROP TABLE mediciones_old")
+                print("[SQLITE] Migración de 'mediciones' completada.")
+            
+            # 2. Nueva tabla de alertas ML
+            conn.execute("""CREATE TABLE IF NOT EXISTS alertas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                nodo_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL, 
+                tipo TEXT, 
+                puntuacion REAL, 
+                severidad TEXT,
+                descripcion TEXT, 
+                estado TEXT DEFAULT 'Activa',
+                enviado INTEGER NOT NULL DEFAULT 0)""")
                 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mediciones_nodo_fecha ON mediciones(nodo_id, timestamp)")
             conn.execute("""CREATE TABLE IF NOT EXISTS configuraciones (
@@ -224,8 +256,6 @@ def sqlite_iniciar():
             cols_fotos = {r[1] for r in conn.execute("PRAGMA table_info(fotos)").fetchall()}
             if "medicion_id" not in cols_fotos:
                 conn.execute("ALTER TABLE fotos ADD COLUMN medicion_id INTEGER")
-            if "enviado" not in cols_med:
-                conn.execute("ALTER TABLE mediciones ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0")
             cols_cfg = {r[1] for r in conn.execute("PRAGMA table_info(configuraciones)").fetchall()}
             if "origen" not in cols_cfg:
                 conn.execute("ALTER TABLE configuraciones ADD COLUMN origen TEXT NOT NULL DEFAULT 'Raspberry'")
@@ -280,9 +310,9 @@ def guardar_sqlite(nodo_id, dato, timestamp):
                     nodo_id, timestamp, temperatura, humedad,
                     nitrogeno, fosforo, potasio,
                     humedad_suelo, temperatura_suelo, conductividad,
-                    ph, bateria, radiacion, payload
+                    ph, bateria, radiacion
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 nodo_id,
                 timestamp,
@@ -296,8 +326,7 @@ def guardar_sqlite(nodo_id, dato, timestamp):
                 _numero(suelo.get("ec")),
                 _numero(suelo.get("ph")),
                 _numero(bateria.get("porcentaje")),
-                _numero(piramometro.get("rad")),
-                json.dumps(dato, ensure_ascii=False),
+                _numero(piramometro.get("rad"))
             ))
             id_medicion = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit()
@@ -306,12 +335,92 @@ def guardar_sqlite(nodo_id, dato, timestamp):
         print(f"[SQLITE] Error guardando medición de {nodo_id}: {e}")
         return None
 
+# ══════════════════════════════════════════════════════════════════════
+#  MACHINE LEARNING — ISOLATION FOREST
+# ══════════════════════════════════════════════════════════════════════
+def entrenar_modelo_iforest():
+    """Extrae datos históricos y entrena el modelo de detección de anomalías."""
+    try:
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            cursor = conn.execute("""
+                SELECT temperatura, humedad, humedad_suelo, temperatura_suelo, ph, conductividad
+                FROM mediciones 
+                WHERE temperatura IS NOT NULL AND humedad_suelo IS NOT NULL
+            """)
+            datos = cursor.fetchall()
+            
+        if len(datos) < 50:
+            print("[ML] Datos insuficientes para entrenar (mínimo 50 registros sanos).")
+            return
+
+        X = np.array(datos)
+        modelo = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
+        modelo.fit(X)
+        joblib.dump(modelo, MODELO_ML_PATH)
+        print("[ML] Modelo Isolation Forest entrenado y guardado con éxito.")
+    except Exception as e:
+        print(f"[ML] Error entrenando modelo: {e}")
+
+def evaluar_anomalias(nodo_id, timestamp, registro):
+    """Evalúa la medición actual en busca de anomalías y genera alertas."""
+    if not os.path.exists(MODELO_ML_PATH):
+        return
+
+    try:
+        modelo = joblib.load(MODELO_ML_PATH)
+        
+        dht = registro.get("dht", {})
+        suelo = registro.get("suelo", {})
+        
+        t = _numero(dht.get("t", dht.get("temp")))
+        h = _numero(dht.get("h", dht.get("hum")))
+        hum_s = _numero(suelo.get("hum"))
+        temp_s = _numero(suelo.get("temp"))
+        ph = _numero(suelo.get("ph"))
+        ec = _numero(suelo.get("ec"))
+
+        if None in [t, h, hum_s, temp_s, ph, ec]:
+            return 
+
+        vector = np.array([[t, h, hum_s, temp_s, ph, ec]])
+        
+        prediccion = modelo.predict(vector) 
+        score = float(modelo.decision_function(vector)[0]) 
+
+        if prediccion[0] == -1:
+            severidad = "Crítica" if score < -0.08 else "Advertencia"
+            descripcion = f"Patrón multivariable inusual detectado. Score: {score:.3f}. Revisar condiciones de suelo y ambiente."
+            
+            with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+                conn.execute("""
+                    INSERT INTO alertas (nodo_id, timestamp, tipo, puntuacion, severidad, descripcion, estado)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (nodo_id, timestamp, "Patrón Multivariable", score, severidad, descripcion, "Activa"))
+                conn.commit()
+            
+            solicitar_sincronizacion()
+            
+    except Exception as e:
+        print(f"[ML] Error evaluando anomalía: {e}")
+
+def _reconstruir_dato(row):
+    return {
+        "tipo": "lectura",
+        "nodo_id": row[1],
+        "timestamp": row[2],
+        "dht": {"t": row[3], "h": row[4]},
+        "suelo": {"N": row[5], "P": row[6], "K": row[7], "hum": row[8], "temp": row[9], "ec": row[10], "ph": row[11]},
+        "bateria": {"porcentaje": row[12]},
+        "piramometro": {"rad": row[13]}
+    }
+
 
 def sqlite_ultimo(nodo_id):
     try:
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
             row = conn.execute("""
-                SELECT timestamp, payload
+                SELECT id, nodo_id, timestamp, temperatura, humedad, nitrogeno, fosforo, potasio, 
+                       humedad_suelo, temperatura_suelo, conductividad, ph, bateria, radiacion
                 FROM mediciones
                 WHERE nodo_id = ?
                 ORDER BY id DESC
@@ -319,13 +428,7 @@ def sqlite_ultimo(nodo_id):
             """, (nodo_id,)).fetchone()
         if not row:
             return None
-        dato = json.loads(row[1])
-        return {
-            "tipo": "lectura",
-            "nodo_id": nodo_id,
-            "timestamp": row[0],
-            **dato,
-        }
+        return _reconstruir_dato(row)
     except Exception as e:
         print(f"[SQLITE] Error consultando último dato: {e}")
         return None
@@ -340,7 +443,8 @@ def sqlite_historial(nodo_id, limite=100):
     try:
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
             rows = conn.execute("""
-                SELECT timestamp, payload
+                SELECT id, nodo_id, timestamp, temperatura, humedad, nitrogeno, fosforo, potasio, 
+                       humedad_suelo, temperatura_suelo, conductividad, ph, bateria, radiacion
                 FROM mediciones
                 WHERE nodo_id = ?
                 ORDER BY id DESC
@@ -348,12 +452,8 @@ def sqlite_historial(nodo_id, limite=100):
             """, (nodo_id, limite)).fetchall()
 
         resultado = []
-        for timestamp, payload in rows:
-            dato = json.loads(payload)
-            resultado.append({
-                "timestamp": timestamp,
-                **dato,
-            })
+        for row in rows:
+            resultado.append(_reconstruir_dato(row))
         return resultado
     except Exception as e:
         print(f"[SQLITE] Error consultando historial: {e}")
@@ -377,7 +477,8 @@ def _cloud_headers():
 def sqlite_mediciones_pendientes(limite=100):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         return conn.execute("""
-            SELECT id, nodo_id, timestamp, payload
+            SELECT id, nodo_id, timestamp, temperatura, humedad, nitrogeno, fosforo, potasio, 
+                   humedad_suelo, temperatura_suelo, conductividad, ph, bateria, radiacion
             FROM mediciones
             WHERE enviado = 0
             ORDER BY id ASC
@@ -415,19 +516,14 @@ def sincronizar_con_nube():
     if not CLOUD_SERVER_URL or "TU-DOMINIO" in CLOUD_SERVER_URL:
         return
 
-    for id_local, nodo_id, timestamp, payload in sqlite_mediciones_pendientes():
+    # 1. Sincronizar Mediciones
+    for row in sqlite_mediciones_pendientes():
         try:
-            datos_originales = json.loads(payload)
-            datos_originales.pop("enviado", None)
-
-            datos = {
-                "tipo": "lectura",
-                "nodo_id": nodo_id,
-                "timestamp": timestamp,
-                **datos_originales,
-            }
-
+            id_local = row[0]
+            nodo_id = row[1]
+            datos = _reconstruir_dato(row)
             numero_nodo = nodo_id.replace("nodo", "", 1)
+            
             respuesta = requests.post(
                 _cloud_url(f"/api/nodos/{numero_nodo}/datos"),
                 json=datos,
@@ -448,9 +544,35 @@ def sincronizar_con_nube():
                 break
 
         except Exception as e:
-            print(f"[SYNC] Error enviando medición {id_local}: {e}")
+            print(f"[SYNC] Error enviando medición: {e}")
             break
 
+    # 2. Sincronizar Alertas ML
+    try:
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            alertas_pendientes = conn.execute("SELECT id, nodo_id, timestamp, tipo, puntuacion, severidad, descripcion FROM alertas WHERE enviado = 0 LIMIT 50").fetchall()
+            
+        for al in alertas_pendientes:
+            datos_alerta = {
+                "timestamp": al[2], "tipo": al[3], "puntuacion": al[4], 
+                "severidad": al[5], "descripcion": al[6]
+            }
+            numero_nodo = al[1].replace("nodo", "", 1)
+            respuesta = requests.post(
+                _cloud_url(f"/api/nodos/{numero_nodo}/alertas"),
+                json=datos_alerta,
+                headers=_cloud_headers(),
+                timeout=CLOUD_TIMEOUT
+            )
+            if respuesta.ok:
+                with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+                    conn.execute("UPDATE alertas SET enviado = 1 WHERE id = ?", (al[0],))
+                    conn.commit()
+                print(f"[SYNC] Alerta ML {al[0]} confirmada por nube.")
+    except Exception as e:
+        print(f"[SYNC] Error enviando alertas ML: {e}")
+
+    # 3. Sincronizar Fotos
     for id_foto, nodo_id, timestamp, ruta_foto, tam_bytes in sqlite_fotos_pendientes():
         try:
             with open(ruta_foto, "rb") as archivo_foto:
@@ -862,6 +984,10 @@ def mqtt_iniciar_global(on_update):
                 registro["timestamp"] = timestamp_medicion
                 guardar_dato(nodo_id, registro)
                 id_medicion = guardar_sqlite(nodo_id, registro, timestamp_medicion)
+                
+                # Evaluación ML de anomalías en tiempo real
+                evaluar_anomalias(nodo_id, timestamp_medicion, registro)
+                
                 aplicar_limpieza_almacenamiento()
                 if id_medicion is not None:
                     solicitar_sincronizacion()
@@ -1208,7 +1334,7 @@ def http_photo_server_iniciar():
 # ══════════════════════════════════════════════════════════════════════
 #  FASTAPI — API REST EXCLUSIVAMENTE (INTERFAZ WEB REMOVIDA)
 # ══════════════════════════════════════════════════════════════════════
-app = FastAPI(title="AgroTech API", version="1.0")
+app = FastAPI(title="AgroTech API", version="4.0")
 
 class ConfigHorarioAPI(BaseModel):
     horarios: list[str]
@@ -1236,6 +1362,20 @@ def api_historial(nodo_id: str, limite: int = 100):
     limite = max(1, min(limite, 5000))
     datos = sqlite_historial(nodo_id, limite)
     return {"nodo_id": nodo_id, "cantidad": len(datos), "datos": datos}
+
+# Nuevo endpoint de alertas para la API
+@app.get("/api/nodos/{nodo_id}/alertas")
+def api_alertas_nodo(nodo_id: str):
+    _validar_nodo(nodo_id)
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        rows = conn.execute("""
+            SELECT id, timestamp, tipo, puntuacion, severidad, descripcion, estado 
+            FROM alertas WHERE nodo_id = ? ORDER BY id DESC LIMIT 50
+        """, (nodo_id,)).fetchall()
+        
+    return {"nodo_id": nodo_id, "alertas": [
+        {"id": r[0], "timestamp": r[1], "tipo": r[2], "puntuacion": r[3], "severidad": r[4], "descripcion": r[5], "estado": r[6]} for r in rows
+    ]}
 
 def _foto_sqlite(nodo_id):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
@@ -1435,7 +1575,7 @@ def build_inicio(on_inicio):
                             padding=ft.Padding.symmetric(horizontal=32,vertical=12),elevation=10),
                         on_click=on_inicio, width=220),
                     ft.Container(height=20),
-                    ft.Text("v3.4 · Quindío, Colombia",size=11,
+                    ft.Text("v4.0.1 · Quindío, Colombia",size=11,
                             color=ft.Colors.with_opacity(0.35,ft.Colors.WHITE)),
                 ], alignment=ft.MainAxisAlignment.CENTER,
                    horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)),
@@ -1630,6 +1770,50 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
             sensor_card("Radiación Solar","W/m²",vRAD,ft.Icons.LIGHT_MODE,C["amarillo"]),
         ], spacing=4, expand=True))
 
+    # Nueva Vista de Alertas ML
+    def construir_vista_alertas():
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            alertas_db = conn.execute("""
+                SELECT timestamp, tipo, puntuacion, severidad, descripcion, estado 
+                FROM alertas WHERE nodo_id = ? ORDER BY id DESC LIMIT 20
+            """, (nodo_id,)).fetchall()
+
+        if not alertas_db:
+            return ft.Container(expand=True, alignment=ft.Alignment(0,0),
+                content=ft.Text("Plantas Sanas. Ninguna anomalía detectada.", color=C["gris_texto"]))
+            
+        columnas = []
+        for al in alertas_db:
+            color_icono = C["rojo"] if al[3] == "Crítica" else C["amarillo"]
+            icono = ft.Icons.WARNING if al[3] == "Crítica" else ft.Icons.ERROR_OUTLINE
+            
+            columnas.append(
+                ft.Container(
+                    border_radius=8, bgcolor=C["blanco"], border=ft.Border.all(1, C["gris_borde"]),
+                    padding=ft.Padding.all(10),
+                    content=ft.Row([
+                        ft.Icon(icono, color=color_icono, size=24),
+                        ft.Column([
+                            ft.Row([
+                                ft.Text(al[3].upper(), size=10, weight=ft.FontWeight.BOLD, color=color_icono),
+                                ft.Text(al[0], size=9, color=C["gris_texto"]),
+                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, expand=True),
+                            ft.Text(al[4], size=11, color=C["negro_texto"]),
+                            ft.Text(f"Tipo: {al[1]} | Score ML: {al[2]:.3f} | Estado: {al[5]}", size=9, color=C["gris_texto"])
+                        ], spacing=2, expand=True)
+                    ])
+                )
+            )
+        return ft.Column(columnas, spacing=6, expand=True, scroll=ft.ScrollMode.AUTO)
+
+    vista_alertas = ft.Container(border_radius=12, bgcolor=C["fondo"],
+        border=ft.Border.all(1, C["rojo"]), padding=ft.Padding.all(8),
+        content=ft.Column([
+            sec_header(ft.Icons.NOTIFICATION_IMPORTANT, "Alertas ML", "Isolation Forest - Detección de Anomalías", C["rojo"]),
+            ft.Divider(color=C["rojo"], height=1),
+            construir_vista_alertas()
+        ], spacing=4, expand=True))
+
     vista_camara = ft.Container(border_radius=12,bgcolor=C["cafe_suave"],
         border=ft.Border.all(1,C["cafe_borde"]),padding=ft.Padding.all(8),
         content=ft.Column([
@@ -1644,8 +1828,8 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                     alignment=ft.Alignment(0,0)),
         ], spacing=4, expand=True))
 
-    vistas = [vista_dht_bat, vista_suelo, vista_piramometro]
-    nombres_vistas = ["DHT22 + Batería", "Sensor de Suelo", "Radiación Solar"]
+    vistas = [vista_dht_bat, vista_suelo, vista_piramometro, vista_alertas]
+    nombres_vistas = ["DHT22 + Batería", "Sensor de Suelo", "Radiación Solar", "Alertas IA"]
 
     if tiene_cam:
         vistas.append(vista_camara)
@@ -1653,6 +1837,9 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
 
     def cambiar_vista(nueva_vista):
         vista_actual["v"] = nueva_vista
+        # Al cambiar a alertas, obligar a refrescar la base de datos visual
+        if nueva_vista == 3:
+            vistas[3].content.controls[2] = construir_vista_alertas()
         contenedor_vistas.content = vistas[nueva_vista]
         actualizar_botones_nav()
         page.update()
@@ -2572,7 +2759,7 @@ def build_historico(nodo, page, on_volver):
 #  APLICACIÓN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════
 def main(page: ft.Page):
-    page.title = "AgroTech Dashboard v3.4"
+    page.title = "AgroTech Dashboard v4.0.1"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
     try:
@@ -2585,6 +2772,8 @@ def main(page: ft.Page):
     cont = ft.Container(expand=True)
 
     sqlite_iniciar()
+    # Entrenar modelo de anomalías si existen suficientes datos sanos.
+    entrenar_modelo_iforest()
     aplicar_limpieza_almacenamiento()
     sincronizador_iniciar()
 
