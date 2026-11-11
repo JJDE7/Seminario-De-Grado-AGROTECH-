@@ -1,783 +1,791 @@
 // ============================================================
-// PROYECTO: NODO DE MONITOREO DE INVERNADERO - ESP32-S3
-// Autor: Proyecto Invernadero UQ
-// Descripcion: Este firmware controla un nodo de sensores que mide
-//              parametros de suelo, ambiente y bateria, los publica
-//              por MQTT y toma fotos con una camara OV2640.
-//              El ESP32 usa deep sleep para ahorrar energia y se
-//              despierta por temporizador (cada hora) o por boton.
-// ============================================================
+// NODOS - INVERNADERO UQ - ESP32-S3 CAM + DS3231
+//
+// Cambios para esta version de codigo ya que solo se le agrego cambio al envio de fotos y envio de datos simulados.
+//  - Datos SIMULADOS de sensores (DHT22, suelo NPK y bateria) que se
+//    publican por MQTT en esp32/nodo2/data justo antes de enviar la
+//    foto, con el mismo JSON que usa simulador_esp32.py:
+//      {"dht":{"t":..,"h":..},
+//       "suelo":{"N":..,"P":..,"K":..,"hum":..,"temp":..,"ec":..,"ph":..},
+//       "bateria":{"porcentaje":..}}
+//  - Para las pruebas como no se contaron con los sensores se agrego una funcio de envio de datos simulados donde
+//   se puede activar/desactivar con #define SIMULAR_SENSORES (mas abajo).
+//    Cuando tengas los sensores reales, comenta esa linea o eliminarla para que se puedan medir con los senores reales.
+//
+//
+// TABLA DE SEÑALES DEL LED (GPIO42)
+//  3 parpadeos 200 ms ....... arranque / test de LED
+//  parpadeo doble rapido .... ventana de 4 s para entrar a config
+//  1 parpadeo largo 700 ms .. WiFi conectado
+//  2 parpadeos 120 ms ....... MQTT conectado
+//  parpadeo lento 500/500 ... MODO CONFIG activo (esperando horario)
+//  5 parpadeos 80 ms ........ horario recibido y guardado OK
+//  LED fijo encendido ....... ciclo de medicion / foto en curso
+//  2 parpadeos 100 ms ....... foto enviada con HTTP 200
+//  4 parpadeos 80 ms ........ servidor respondio != 200
+//   
 
-// --- Librerias necesarias ---
-#include "esp_camera.h"        // Controla la camara OV2640 integrada
-#include <ModbusMaster.h>      // Protocolo Modbus RTU para leer el sensor de suelo por RS485
-#include <WiFi.h>              // Conexion WiFi del ESP32
-#include <PubSubClient.h>      // Cliente MQTT para enviar y recibir mensajes
-#include "DHT.h"               // Sensor de temperatura y humedad ambiental DHT22
-#include <Wire.h>              // Protocolo I2C para comunicar con el RTC y el INA219
-#include "RTClib.h"            // Modulo reloj en tiempo real DS3231
-#include "esp_sleep.h"         // Funciones de bajo consumo (deep sleep) del ESP32
-#include <Adafruit_INA219.h>   // Sensor de voltaje y corriente para monitorear la bateria
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include "RTClib.h"
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"      
+#include <HTTPClient.h>
 
-// Comandos MQTT utiles para depuracion desde la Raspberry Pi:
-// mosquitto_sub -h 192.168.1.101 -t "esp32/#" -t "cam/#" -v
-// mosquitto_sub -h 192.168.1.101 -t esp32/nodo2/data -v
-// Para enviar horario: mosquitto_pub -h 192.168.1.101 -t esp32/config -m '{"horas":[6,12,18]}'
-
-// ============================================================
-// CONFIGURACION DE PINES DE HARDWARE
-// ============================================================
-#define TX_PIN       18   // Pin de transmision del puerto serial RS485 (sensor de suelo)
-#define RX_PIN       16   // Pin de recepcion del puerto serial RS485
-#define DE_RE        17   // Pin que controla la direccion del bus RS485 (transmitir o recibir)
-#define PIN_CONTROL  15   // Pin que enciende o apaga la alimentacion del sensor de suelo
-#define PIN_BOTON     0   // Boton fisico para activar el modo configuracion (GPIO0)
-#define DHTPIN       41   // Pin de datos del sensor DHT22
-#define DHTTYPE      DHT22 // Tipo de sensor DHT que estoy usando
-#define LED_PIN      42   // Pin del LED indicador (GPIO42 - verificar que no este en modo JTAG)
-
-// Rango de voltaje de la bateria: aqui defino el 100% y el 0% de carga
-// Esto aplica para bateria 3S LiFePO4 o bateria de plomo-acido de 12V
-const float VOLT_MAX = 12.6f;  // Voltaje de bateria completamente cargada
-const float VOLT_MIN = 10.5f;  // Voltaje de bateria completamente descargada
+// ---- Sensores deshabilitados (se conservan comentados para las pruebas de datos simulados) ----
+// #include <ModbusMaster.h>
+// #include "DHT.h"
+// #include <Adafruit_INA219.h>
 
 // ============================================================
-// CREDENCIALES WIFI Y CONFIGURACION MQTT
+// MODO PRUEBA
+// Descomentado = en CADA arranque hace el diagnostico y manda una
+// foto de prueba. Comentalo cuando ya funcione todo.
 // ============================================================
-const char* WIFI_SSID = "Invernaderouq";    // Nombre de la red WiFi del invernadero
-const char* WIFI_PASS = "Invernaderouq";    // Contrasena de la red WiFi
-const char* MQTT_HOST = "192.168.1.101";    // Direccion IP del broker MQTT (Raspberry Pi)
-const uint16_t MQTT_PORT = 1883;            // Puerto MQTT estandar
-
-// Objetos de conexion
-WiFiClient   espClient;      // Cliente de red para la conexion WiFi
-PubSubClient mqtt(espClient); // Cliente MQTT que usa la conexion WiFi anterior
+//define MODO_PRUEBA
 
 // ============================================================
-// OBJETOS DE HARDWARE
+// IDENTIDAD DEL NODO  (antes el firmware no lo decia en ningun lado)
 // ============================================================
-ModbusMaster     node;     // Objeto para comunicacion Modbus con el sensor de suelo
-RTC_DS3231       rtc;      // Objeto del modulo reloj de tiempo real
-DHT              dht(DHTPIN, DHTTYPE); // Objeto sensor DHT22
-Adafruit_INA219  ina219(0x45); // Sensor INA219 en direccion I2C 0x45
+#define NODO_ID       "nodo2"
+#define TOPIC_STATUS  "esp32/nodo2/status"
+#define TOPIC_DATA    "esp32/nodo2/data"
+#define TOPIC_CONFIG  "esp32/nodo2/config"   // topico propio del nodo
+#define TOPIC_CFG_ALL "esp32/config"         // topico global
+#define TOPIC_CFG_OK  "esp32/nodo2/configok" // confirmacion hacia la interfaz
+#define TOPIC_TIME    "esp32/nodo2/time"     
+#define MQTT_CLIENT_ID "esp32_s3_nodo2"
 
 // ============================================================
-// MEMORIA RTC - PERSISTE ENTRE CICLOS DE DEEP SLEEP
-// Estas variables NO se borran cuando el ESP32 entra en deep sleep
-// porque se guardan en la RAM del modulo RTC interno del chip
+// PINES
 // ============================================================
-RTC_DATA_ATTR int  horasConfig[24]; // Arreglo con las horas programadas para medir (max 24)
-RTC_DATA_ATTR int  numHoras  = 0;   // Cantidad de horas guardadas en el arreglo anterior
-RTC_DATA_ATTR bool modoConfig = false; // Bandera que indica si el modo configuracion esta activo
+#define PIN_BOTON   15      // boton a GND, con pull-up interno
+#define LED_PIN     42      // LED indicador
+
+#define I2C_SDA     47      //RTC DS3231
+#define I2C_SCL     36
+
+// ---- RS485 / DHT / INA219 deshabilitados ----
+// #define TX_PIN 18
+// #define RX_PIN 16
+// #define DE_RE  17
+// #define PIN_CONTROL 15
+// #define DHTPIN 41
+// #define DHTTYPE DHT22
+// const float VOLT_MAX = 12.6f;
+// const float VOLT_MIN = 10.5f;
 
 // ============================================================
-// VARIABLES GLOBALES DE SENSORES
-// Se actualizan en cada ciclo de lectura
+// RED
 // ============================================================
-float    ph = NAN, humedad = NAN, temperatura = NAN; // Datos del sensor de suelo
-uint16_t ec = 0, nitrogeno = 0, fosforo = 0, potasio = 0; // Mas datos del sensor de suelo
-float    dht_h = NAN, dht_t = NAN;     // Temperatura y humedad del aire (DHT22)
-float    bat_voltaje    = 0;            // Voltaje actual de la bateria
-float    bat_corriente  = 0;            // Corriente que consume o entrega la bateria (mA)
-float    bat_porcentaje = 0;            // Porcentaje de carga de la bateria
+const char* WIFI_SSID = "JJD";
+const char* WIFI_PASS = "JJDE0701";
+
+// IMPORTANTE: esta IP debe ser la IP LAN ACTUAL de la PC donde corre todo el servicio
+// ipconfig / ip a antes de compilar.
+const char* MQTT_HOST = "10.103.235.61";
+const uint16_t MQTT_PORT = 1883;
+const char* PHOTO_SERVER_URL = "http://10.103.235.61:8081/upload";
+
+WiFiClient   espClient;
+PubSubClient mqtt(espClient);
+RTC_DS3231   rtc;
 
 // ============================================================
-// FUNCION: ledBlink
-// Hace parpadear el LED sin bloquear el loop de MQTT
-// Parametros:
-//   veces   - cuantas veces parpadea
-//   ms_on   - milisegundos que permanece encendido
-//   ms_off  - milisegundos que permanece apagado
+// MEMORIA RTC (sobrevive al deep sleep)
+// ============================================================
+RTC_DATA_ATTR int  horasConfig[24];     // Tiempo en horas
+RTC_DATA_ATTR int  minutosConfig[24];   // Tiempo en minutos
+RTC_DATA_ATTR int  numHoras   = 0;
+RTC_DATA_ATTR bool modoConfig = false;
+RTC_DATA_ATTR uint32_t ultimaMedicion = 0;   
+RTC_DATA_ATTR float bateriaSim = 0.0f;       //bateria simulada (sobrevive al deep sleep)
+
+const long TOL_SEG = 120;   // tolerancia de +/- 2 min alrededor del horario
+
+// ============================================================
+// SENSORES SIMULADOS
+// Descomentado = se publican datos aleatorios en TOPIC_DATA en cada
+// ciclo de medicion. Comentalo cuando conectes los sensores reales.
+// ============================================================
+#define SIMULAR_SENSORES
+
+// Rangos (mismos que simulador_esp32.py)
+#define SIM_DHT_T_MIN    18.0f
+#define SIM_DHT_T_MAX    32.0f
+#define SIM_DHT_H_MIN    45.0f
+#define SIM_DHT_H_MAX    90.0f
+#define SIM_N_MIN        20
+#define SIM_N_MAX        180
+#define SIM_P_MIN        10
+#define SIM_P_MAX        100
+#define SIM_K_MIN        30
+#define SIM_K_MAX        250
+#define SIM_SHUM_MIN     25.0f
+#define SIM_SHUM_MAX     85.0f
+#define SIM_STEMP_MIN    17.0f
+#define SIM_STEMP_MAX    30.0f
+#define SIM_EC_MIN       200
+#define SIM_EC_MAX       1800
+#define SIM_PH_MIN       5.0f
+#define SIM_PH_MAX       7.5f
+#define SIM_BAT_MIN      55.0f
+#define SIM_BAT_MAX      100.0f
+
+// Bandera que pone el callback cuando llega un horario valido
+volatile bool horarioRecibido = false;
+
+// Prototipos (para no depender del auto-prototipado del IDE)
+void callback(char* topic, byte* payload, unsigned int length);
+bool wifiConnect();
+bool mqttConnect(int intentos = 3);
+void enviarFoto();
+
+// ============================================================
+// LED
 // ============================================================
 void ledBlink(int veces, int ms_on, int ms_off) {
   for (int i = 0; i < veces; i++) {
-    digitalWrite(LED_PIN, HIGH); delay(ms_on);   // Enciendo el LED
-    digitalWrite(LED_PIN, LOW);  delay(ms_off);  // Apago el LED
+    digitalWrite(LED_PIN, HIGH); delay(ms_on);
+    digitalWrite(LED_PIN, LOW);  delay(ms_off);
   }
 }
 
-// ============================================================
-// FUNCION: testLED
-// Prueba el LED al inicio del programa con 3 parpadeos rapidos
-// Si no parpadea, hay un problema con el pin GPIO42 o el circuito
-// ============================================================
 void testLED() {
   Serial.println("Test LED GPIO42 - 3 parpadeos...");
-  ledBlink(3, 200, 200);  // 3 parpadeos de 200ms cada uno
-  Serial.println("   Si no viste 3 parpadeos, revisa:");
-  Serial.println("   1) Resistencia limitadora en el LED");
-  Serial.println("   2) GPIO42 puede estar en modo JTAG - prueba GPIO38 o GPIO39");
+  ledBlink(3, 200, 200);
 }
 
 // ============================================================
-// FUNCION: base64_encode
-// Convierte datos binarios (como una foto JPEG) en texto Base64
-// Esto es necesario porque MQTT no transmite datos binarios crudos
-// Parametros:
-//   data   - puntero al arreglo de bytes a codificar
-//   length - cantidad de bytes en el arreglo
-// Retorna: String con la representacion Base64
+// WIFI  (ahora devuelve bool)
 // ============================================================
-String base64_encode(uint8_t* data, size_t length) {
-  // Tabla de caracteres validos en Base64
-  static const char table[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  String output = "";
-  output.reserve((length * 4 / 3) + 4); // Reservo memoria para evitar reasignaciones
-
-  // Proceso los bytes de a 3, convirtiendolos en 4 caracteres Base64
-  for (size_t i = 0; i < length; i += 3) {
-    // Agrupo 3 bytes en un entero de 24 bits
-    uint32_t val = ((uint32_t)data[i] << 16) |
-                   (i + 1 < length ? (uint32_t)data[i + 1] << 8 : 0) |
-                   (i + 2 < length ? (uint32_t)data[i + 2]      : 0);
-    // Extraigo los 4 grupos de 6 bits y los mapeo al caracter Base64 correspondiente
-    output += table[(val >> 18) & 0x3F];
-    output += table[(val >> 12) & 0x3F];
-    output += (i + 1 < length) ? table[(val >> 6) & 0x3F] : '='; // Relleno con = si faltan bytes
-    output += (i + 2 < length) ? table[val        & 0x3F] : '='; // Relleno con = si faltan bytes
-  }
-  return output;
-}
-
-// ============================================================
-// FUNCION: enviarFoto
-// Captura una foto con la camara OV2640 y la envia por MQTT
-// en fragmentos de 512 caracteres Base64
-// El receptor debe ensamblar los fragmentos usando los mensajes
-// "cam/start" (tamano total), "cam/data" (fragmentos) y "cam/end"
-// ============================================================
-void enviarFoto() {
-  Serial.println("Capturando foto...");
-  camera_fb_t* fb = esp_camera_fb_get(); // Obtengo el frame buffer de la camara
-  if (!fb) { Serial.println("Error: No se pudo obtener frame"); return; }
-
-  Serial.println("Codificando en Base64...");
-  String encoded  = base64_encode(fb->buf, fb->len); // Convierto la foto JPEG a Base64
-  int    total_len = encoded.length();                // Calculo el tamano total en caracteres
-
-  Serial.printf("Enviando foto (%d bytes) en fragmentos...\n", total_len);
-  mqtt.publish("cam/start", String(total_len).c_str()); // Aviso al receptor el tamano total
-  delay(100); // Espero un momento para que el receptor procese el aviso
-
-  // Envio la foto en fragmentos de 512 caracteres para no saturar el buffer MQTT
-  for (int i = 0; i < total_len; i += 512) {
-    String chunk = encoded.substring(i, min(i + 512, total_len)); // Extraigo el fragmento
-    if (!mqtt.publish("cam/data", chunk.c_str()))
-      Serial.println("Fallo al publicar fragmento"); // Aviso si hubo error
-    mqtt.loop(); // Mantengo la conexion MQTT activa durante el envio
-    delay(50);   // Pequena pausa entre fragmentos para no saturar la red
-  }
-
-  mqtt.publish("cam/end", "fin"); // Aviso al receptor que la foto termino
-  Serial.println("Foto enviada correctamente");
-  esp_camera_fb_return(fb); // Libero la memoria del frame buffer
-}
-
-// ============================================================
-// FUNCIONES RS485: preTransmission y postTransmission
-// El bus RS485 es half-duplex: el pin DE_RE controla si el
-// modulo esta en modo transmision (HIGH) o recepcion (LOW)
-// Estas funciones las usa la libreria ModbusMaster automaticamente
-// ============================================================
-void preTransmission()  { digitalWrite(DE_RE, HIGH); } // Modo transmision
-void postTransmission() { digitalWrite(DE_RE, LOW);  } // Modo recepcion
-
-// ============================================================
-// FUNCION: wifiConnect
-// Intenta conectar al WiFi con un tiempo maximo de 10 segundos
-// Si no logra conectarse, continua de todas formas (no bloquea)
-// ============================================================
-void wifiConnect() {
+bool wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return true;
   Serial.print("Conectando WiFi...");
-  WiFi.mode(WIFI_STA);               // Modo estacion (cliente), no punto de acceso
-  WiFi.begin(WIFI_SSID, WIFI_PASS);  // Inicio la conexion con las credenciales definidas
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long t = millis();
-  // Espero maximo 10 segundos a que se conecte
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
-    delay(500); Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
+    delay(300); Serial.print(".");
   }
-  Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " FALLO");
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  Serial.println(ok ? " OK" : " FALLO");
+  if (ok) {
+    Serial.print("  IP del nodo: "); Serial.println(WiFi.localIP());
+    ledBlink(1, 700, 200);          // SEÑAL: WiFi conectado
+  }
+  return ok;
 }
 
 // ============================================================
-// FUNCION: callback (MQTT)
-// Se ejecuta automaticamente cuando llega un mensaje por MQTT
-// Espera mensajes en el topico "esp32/config" con el formato:
-//   {"horas":[6,12,18]}
-// Extrae las horas del JSON de forma manual (sin libreria JSON)
-// y las guarda en la memoria RTC para que persistan en deep sleep
+// MQTT con limite de intentos
 // ============================================================
+void mqttSetup() {
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(callback);
+  mqtt.setBufferSize(2048);
+  mqtt.setKeepAlive(30);
+  mqtt.setSocketTimeout(5);
+}
+
+bool mqttConnect(int intentos) {
+  if (!wifiConnect()) return false;
+  mqttSetup();
+  for (int i = 0; i < intentos && !mqtt.connected(); i++) {
+    Serial.printf("Conectando MQTT (%d/%d)...", i + 1, intentos);
+    if (mqtt.connect(MQTT_CLIENT_ID)) {
+      mqtt.subscribe(TOPIC_CONFIG);
+      mqtt.subscribe(TOPIC_CFG_ALL);
+      mqtt.subscribe(TOPIC_TIME);
+      Serial.println(" OK");
+      ledBlink(2, 120, 120);        // SEÑAL: MQTT conectado
+      return true;
+    }
+    Serial.printf(" fallo rc=%d\n", mqtt.state());
+    delay(1500);
+  }
+  if (!mqtt.connected()) Serial.println("MQTT no disponible, continuo sin el.");
+  return mqtt.connected();
+}
+
+void mqttPublish(const char* topic, const char* msg) {
+  if (mqtt.connected()) {
+    mqtt.publish(topic, msg);
+    mqtt.loop();
+    delay(120);
+  }
+}
+
+// ============================================================
+// JSON DE CONFIGURACION
+// La interfaz manda:
+// {"horas":[10,18],"minutos":[30,0],"fecha":"2026-09-21 14:05:33"}
+// ============================================================
+static int extraerLista(const String& msg, const char* clave, int* destino, int maxN) {
+  String key = String("\"") + clave + "\"";
+  int idx = msg.indexOf(key);
+  if (idx == -1) return -1;
+  int start = msg.indexOf('[', idx);
+  int end   = msg.indexOf(']', start);
+  if (start == -1 || end == -1) return -1;
+
+  String arr = msg.substring(start + 1, end);
+  int n = 0, pos = 0;
+  while (pos <= (int)arr.length() && n < maxN) {
+    int comma = arr.indexOf(',', pos);
+    if (comma == -1) comma = arr.length();
+    String num = arr.substring(pos, comma);
+    num.trim();
+    if (num.length() > 0) destino[n++] = num.toInt();
+    pos = comma + 1;
+  }
+  return n;
+}
+
+static void sincronizarRTC(const String& msg) {
+  int idx = msg.indexOf("\"fecha\"");
+  if (idx == -1) return;
+  int q1 = msg.indexOf('"', msg.indexOf(':', idx));
+  int q2 = msg.indexOf('"', q1 + 1);
+  if (q1 == -1 || q2 == -1) return;
+
+  String f = msg.substring(q1 + 1, q2);   // "YYYY-MM-DD HH:MM:SS"
+  if (f.length() < 19) return;
+
+  int yy = f.substring(0, 4).toInt();
+  int mo = f.substring(5, 7).toInt();
+  int dd = f.substring(8, 10).toInt();
+  int hh = f.substring(11, 13).toInt();
+  int mi = f.substring(14, 16).toInt();
+  int ss = f.substring(17, 19).toInt();
+
+  if (yy > 2020) {
+    rtc.adjust(DateTime(yy, mo, dd, hh, mi, ss));
+    Serial.printf("RTC sincronizado -> %04d-%02d-%02d %02d:%02d:%02d\n",
+                  yy, mo, dd, hh, mi, ss);
+  }
+}
+
 void callback(char* topic, byte* payload, unsigned int length) {
-  // Convierto el payload de bytes a String para poder procesarlo
   String msg = "";
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   Serial.printf("\nMQTT [%s]: %s\n", topic, msg.c_str());
 
-  // Busco la clave "horas" en el JSON recibido
-  int idx = msg.indexOf("\"horas\"");
-  if (idx == -1) { Serial.println("Clave 'horas' no encontrada"); return; }
-
-  // Busco los corchetes que delimitan el arreglo de horas
-  int start = msg.indexOf('[', idx);
-  int end   = msg.indexOf(']', start);
-  if (start == -1 || end == -1) { Serial.println("Formato invalido"); return; }
-
-  // Extraigo el contenido entre los corchetes y proceso cada numero separado por comas
-  String arr = msg.substring(start + 1, end);
-  numHoras = 0; // Reinicio el contador de horas
-  int pos  = 0;
-
-  while (pos <= (int)arr.length() && numHoras < 24) {
-    int comma = arr.indexOf(',', pos);
-    if (comma == -1) comma = arr.length(); // Ultimo elemento sin coma al final
-    String num = arr.substring(pos, comma);
-    num.trim(); // Elimino espacios en blanco
-    if (num.length() > 0) {
-      int hora = num.toInt();
-      if (hora >= 0 && hora <= 23)           // Solo acepto horas validas (0-23)
-        horasConfig[numHoras++] = hora;      // Guardo la hora en la memoria RTC
-    }
-    pos = comma + 1;
+  // ---- v13: la hora llega por su propio topico, sin retain ----
+  if (strcmp(topic, TOPIC_TIME) == 0) {
+    if (modoConfig) sincronizarRTC(msg);
+    else Serial.println("Hora ignorada (solo se acepta en MODO CONFIG)");
+    return;
   }
 
-  // Muestro el horario guardado por el monitor serial
-  Serial.printf("Horario guardado (%d horas): ", numHoras);
-  for (int i = 0; i < numHoras; i++)
-    Serial.printf("%d%s", horasConfig[i], i < numHoras - 1 ? ", " : "\n");
-}
+  int h[24], m[24];
+  int nH = extraerLista(msg, "horas", h, 24);
+  if (nH <= 0) { Serial.println("Clave 'horas' no encontrada o vacia"); return; }
+  int nM = extraerLista(msg, "minutos", m, 24);
 
-// ============================================================
-// FUNCION: mqttReconnect
-// Intenta conectar al broker MQTT hasta que lo logre
-// Se suscribe al topico de configuracion al conectarse
-// ============================================================
-void mqttReconnect() {
-  while (!mqtt.connected()) {
-    Serial.print("Conectando MQTT...");
-    if (mqtt.connect("esp32_s3_nodo2")) {    // Me identifico como "esp32_s3_nodo2"
-      mqtt.subscribe("esp32/config");         // Me suscribo para recibir configuracion de horario
-      Serial.println(" OK");
-    } else {
-      Serial.printf(" fallo rc=%d, reintentando...\n", mqtt.state());
-      delay(2000); // Espero 2 segundos antes de reintentar
+  numHoras = 0;
+  for (int i = 0; i < nH; i++) {
+    int hora = h[i];
+    int minu = (nM == nH) ? m[i] : 0;   // si no vienen minutos, :00
+    if (hora >= 0 && hora <= 23 && minu >= 0 && minu <= 59) {
+      horasConfig[numHoras]   = hora;
+      minutosConfig[numHoras] = minu;
+      numHoras++;
     }
   }
-}
 
-// ============================================================
-// FUNCION: esHoraDeMedir
-// Verifica si la hora actual esta entre las horas programadas
-// Retorna true si corresponde medir en esta hora
-// ============================================================
-bool esHoraDeMedir(int horaActual) {
+  // NUNCA se toca el RTC aqui. Este mensaje es retenido y llega
+  // en cada despertar con la fecha en que se configuro (vieja).
+
+  Serial.printf("Horario guardado (%d): ", numHoras);
   for (int i = 0; i < numHoras; i++)
-    if (horasConfig[i] == horaActual) return true; // Encontre la hora en el horario
-  return false; // La hora actual no esta en el horario
+    Serial.printf("%02d:%02d%s", horasConfig[i], minutosConfig[i],
+                  i < numHoras - 1 ? ", " : "\n");
+
+  // Confirmacion hacia la interfaz (publish directo, sin mqtt.loop()
+  // dentro del callback para evitar reentrada)
+  char ack[256];
+  int  p = snprintf(ack, sizeof(ack), "{\"nodo\":\"%s\",\"ok\":true,\"horarios\":[", NODO_ID);
+  for (int i = 0; i < numHoras && p < (int)sizeof(ack) - 16; i++)
+    p += snprintf(ack + p, sizeof(ack) - p, "\"%02d:%02d\"%s",
+                  horasConfig[i], minutosConfig[i], i < numHoras - 1 ? "," : "");
+  snprintf(ack + p, sizeof(ack) - p, "]}");
+  mqtt.publish(TOPIC_CFG_OK, ack);
+
+  horarioRecibido = true;   // el bucle de config lo usa para el parpadeo
 }
 
 // ============================================================
-// FUNCION: leerSensor
-// Lee el sensor de suelo por Modbus RTU (RS485)
-// Toma 6 muestras de cada variable y calcula el promedio
-// Esto reduce el error por ruido electrico en la medicion
-// Variables leidas: pH, humedad, temperatura, EC, N, P, K
+// HORARIOS
 // ============================================================
-void leerSensor() {
-  Serial.println("Leyendo sensor de suelo (6 muestras)...");
+// Distancia en segundos entre "actual" (seg. desde medianoche) y el
+// horario i. Positivo = falta; negativo = ya paso. Rango +/- 12 h.
+static long distanciaAlHorario(long actual, int i) {
+  long prog = horasConfig[i] * 3600L + minutosConfig[i] * 60L;
+  long d = prog - actual;
+  if (d >  43200L) d -= 86400L;
+  if (d < -43200L) d += 86400L;
+  return d;
+}
 
-  // Acumuladores para calcular el promedio
-  long sum_ph = 0, sum_hum = 0, sum_temp = 0, sum_ec = 0;
-  long sum_n  = 0, sum_p   = 0, sum_k    = 0;
-  // Contadores de lecturas exitosas (para no dividir por cero)
-  int  c_ph   = 0, c_hum   = 0, c_temp   = 0, c_ec  = 0;
-  int  c_n    = 0, c_p     = 0, c_k      = 0;
+static long segundosDelDia(const DateTime& now) {
+  return now.hour() * 3600L + now.minute() * 60L + now.second();
+}
 
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("  muestra %d/6\n", i + 1);
-    // Leo cada registro Modbus - si la lectura falla, el contador no aumenta
-    // Los registros Holding se leen con readHoldingRegisters(direccion, cantidad)
-    if (node.readHoldingRegisters(0x0006, 1) == node.ku8MBSuccess) { sum_ph   += node.getResponseBuffer(0); c_ph++;   } delay(20);
-    if (node.readHoldingRegisters(0x0012, 1) == node.ku8MBSuccess) { sum_hum  += node.getResponseBuffer(0); c_hum++;  } delay(20);
-    if (node.readHoldingRegisters(0x0013, 1) == node.ku8MBSuccess) { sum_temp += node.getResponseBuffer(0); c_temp++; } delay(20);
-    if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess) { sum_ec   += node.getResponseBuffer(0); c_ec++;   } delay(20);
-    if (node.readHoldingRegisters(0x001E, 1) == node.ku8MBSuccess) { sum_n    += node.getResponseBuffer(0); c_n++;    } delay(20);
-    if (node.readHoldingRegisters(0x001F, 1) == node.ku8MBSuccess) { sum_p    += node.getResponseBuffer(0); c_p++;    } delay(20);
-    if (node.readHoldingRegisters(0x0020, 1) == node.ku8MBSuccess) { sum_k    += node.getResponseBuffer(0); c_k++;    } delay(100);
+// Devuelve el indice del horario que toca atender ahora (dentro de
+// +/- TOL_SEG) o -1. Evita repetir la foto si ya se hizo hace < 5 min.
+int horarioActivo(const DateTime& now) {
+  long dt = (long)now.unixtime() - (long)ultimaMedicion;
+  if (ultimaMedicion != 0 && dt >= 0 && dt < 300) return -1;
+
+  long actual = segundosDelDia(now);
+  for (int i = 0; i < numHoras; i++) {
+    long d = distanciaAlHorario(actual, i);
+    if (d >= -TOL_SEG && d <= TOL_SEG) return i;
   }
-
-  // Calculo los promedios y aplico los factores de escala del sensor
-  // El sensor entrega valores enteros que debo dividir por 100 o 10 para obtener el valor real
-  ph          = c_ph   > 0 ? (sum_ph   / (float)c_ph)   * 0.01f : NAN; // pH con 2 decimales
-  humedad     = c_hum  > 0 ? (sum_hum  / (float)c_hum)  * 0.1f  : NAN; // Humedad en %
-  temperatura = c_temp > 0 ? (sum_temp / (float)c_temp) * 0.1f  : NAN; // Temperatura en grados C
-  ec          = c_ec   > 0 ? (uint16_t)(sum_ec  / c_ec)          : 0;   // Conductividad en uS/cm
-  nitrogeno   = c_n    > 0 ? (uint16_t)(sum_n   / c_n)           : 0;   // Nitrogeno en mg/kg
-  fosforo     = c_p    > 0 ? (uint16_t)(sum_p   / c_p)           : 0;   // Fosforo en mg/kg
-  potasio     = c_k    > 0 ? (uint16_t)(sum_k   / c_k)           : 0;   // Potasio en mg/kg
-
-  Serial.printf("  -> pH:%.2f Hum:%.1f Temp:%.1f EC:%u N:%u P:%u K:%u\n",
-                ph, humedad, temperatura, ec, nitrogeno, fosforo, potasio);
+  return -1;
 }
 
-// ============================================================
-// FUNCION: leerDHT
-// Lee la temperatura y humedad del aire con el sensor DHT22
-// Los valores se guardan en las variables globales dht_h y dht_t
-// ============================================================
-void leerDHT() {
-  dht_h = dht.readHumidity();     // Humedad relativa del aire en %
-  dht_t = dht.readTemperature();  // Temperatura del aire en grados Celsius
-  Serial.printf("  -> DHT Temp:%.1f Hum:%.1f\n", dht_t, dht_h);
-}
-
-// ============================================================
-// FUNCION: leerBateria
-// Lee el voltaje y la corriente de la bateria con el INA219
-// Toma 5 muestras y promedia para mayor precision
-// Calcula el porcentaje de carga segun los voltajes definidos arriba
-// ============================================================
-void leerBateria() {
-  float suma_v = 0; // Suma de lecturas de voltaje
-  float suma_a = 0; // Suma de lecturas de corriente
-
-  // Tomo 5 muestras con pequena pausa entre ellas
-  for (int i = 0; i < 5; i++) {
-    suma_v += ina219.getBusVoltage_V();   // Voltaje del bus en voltios
-    suma_a += ina219.getCurrent_mA();     // Corriente en miliamperios
-    delay(10);
+// Cuantos segundos dormir. El timer interno del ESP32 tiene error de
+// varios %, asi que si falta mucho se duerme solo el 90 % y se vuelve
+// a calcular con el DS3231; cerca del horario se despierta 25 s antes.
+uint64_t segundosDeSueno(const DateTime& now) {
+  if (numHoras == 0) return 3600ULL;
+  long actual = segundosDelDia(now);
+  long mejor  = 2 * 86400L;
+  for (int i = 0; i < numHoras; i++) {
+    long d = distanciaAlHorario(actual, i);
+    if (d <= 0) d += 86400L;              // ya paso hoy -> manana
+    if (d < mejor) mejor = d;
   }
+  Serial.printf("Proximo horario en %ld s\n", mejor);
+  if (mejor > 300) return (uint64_t)(mejor - mejor / 10);
+  if (mejor > 30)  return (uint64_t)(mejor - 25);
+  return 1ULL;
+}
 
-  bat_voltaje   = suma_v / 5.0f; // Calculo el promedio de voltaje
-  bat_corriente = suma_a / 5.0f; // Calculo el promedio de corriente
-
-  // Calculo el porcentaje de carga con interpolacion lineal entre VOLT_MIN y VOLT_MAX
-  bat_porcentaje = ((bat_voltaje - VOLT_MIN) / (VOLT_MAX - VOLT_MIN)) * 100.0f;
-  bat_porcentaje = constrain(bat_porcentaje, 0.0f, 100.0f); // Limito entre 0% y 100%
-
-  Serial.printf("  -> Bateria: %.2f V | %.2f mA | %.1f %%\n",
-                bat_voltaje, bat_corriente, bat_porcentaje);
-
-  if (bat_porcentaje < 20.0f)
-    Serial.println("  ADVERTENCIA: bateria baja"); // Aviso si la bateria esta casi vacia
+// Espera activa (leyendo el DS3231) hasta que llegue la hora exacta.
+void esperarHoraExacta(int idx) {
+  while (true) {
+    DateTime n = rtc.now();
+    long d = distanciaAlHorario(segundosDelDia(n), idx);
+    if (d <= 0 || d > TOL_SEG) break;
+    Serial.printf("Faltan %ld s para el horario...\n", d);
+    if (mqtt.connected()) mqtt.loop();
+    delay(d > 2 ? 1000 : 200);
+  }
 }
 
 // ============================================================
-// FUNCION: publicarTodo
-// Construye un mensaje JSON con todos los datos de los sensores
-// y lo publica en el topico MQTT "esp32/nodo2/data"
-// Tambien reconecta el WiFi y MQTT antes de publicar
-// ============================================================
-void publicarTodo() {
-  char  msg[512]; // Buffer para el mensaje JSON
-  // Convierto NAN a 0 para evitar valores invalidos en el JSON
-  float t    = isnan(dht_t)       ? 0 : dht_t;
-  float h    = isnan(dht_h)       ? 0 : dht_h;
-  float hums = isnan(humedad)     ? 0 : humedad;
-  float tems = isnan(temperatura) ? 0 : temperatura;
-  float phv  = isnan(ph)          ? 0 : ph;
-
-  // Construyo el JSON con todos los datos en una sola cadena
-  snprintf(msg, sizeof(msg),
-    "{"
-      "\"dht\":{\"t\":%.2f,\"h\":%.2f},"
-      "\"suelo\":{\"N\":%u,\"P\":%u,\"K\":%u,\"hum\":%.1f,\"temp\":%.1f,\"ec\":%u,\"ph\":%.2f},"
-      "\"bateria\":{\"porcentaje\":%.1f,\"voltaje\":%.2f,\"corriente_mA\":%.2f}"
-    "}",
-    t, h,
-    nitrogeno, fosforo, potasio, hums, tems, ec, phv,
-    bat_porcentaje, bat_voltaje, bat_corriente);
-
-  // Me aseguro de estar conectado antes de publicar
-  wifiConnect();
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(callback);
-  mqtt.setBufferSize(2048); // Buffer grande porque el JSON puede ser largo
-  mqttReconnect();
-
-  Serial.println(msg); // Muestro el JSON en el monitor serial para depuracion
-  Serial.println(mqtt.publish("esp32/nodo2/data", msg) ? "MQTT OK" : "MQTT ERROR");
-  mqtt.loop();  // Proceso mensajes entrantes (por si llego un nuevo horario)
-  delay(300);
-}
-
-// ============================================================
-// FUNCION: initCamera
-// Inicializa la camara OV2640 con la configuracion de pines
-// del modulo ESP32-S3 CAM que estoy usando
-// Retorna true si la camara inicio correctamente
+// CAMARA
 // ============================================================
 bool initCamera() {
   camera_config_t config;
-  // Configuracion del controlador LEDC para el reloj de la camara
   config.ledc_channel  = LEDC_CHANNEL_0;
   config.ledc_timer    = LEDC_TIMER_0;
-  // Pines de datos de la camara (bus paralelo de 8 bits D0-D7)
-  config.pin_d0        = 5;  config.pin_d1     = 3;
-  config.pin_d2        = 2;  config.pin_d3     = 4;
-  config.pin_d4        = 6;  config.pin_d5     = 8;
-  config.pin_d6        = 9;  config.pin_d7     = 11;
-  // Pines de control de la camara
-  config.pin_xclk      = 10; // Reloj externo para la camara
-  config.pin_pclk      = 7;  // Reloj de pixel
-  config.pin_vsync     = 13; // Sincronizacion vertical
-  config.pin_href      = 12; // Referencia horizontal
-  config.pin_sccb_sda  = 21; // I2C datos (bus SCCB de la camara)
-  config.pin_sccb_scl  = 14; // I2C reloj
-  config.pin_pwdn      = -1; // No uso pin de power down
-  config.pin_reset     = -1; // No uso pin de reset
-  config.xclk_freq_hz  = 20000000;      // Frecuencia de reloj: 20 MHz
-  config.pixel_format  = PIXFORMAT_JPEG; // Formato de salida: JPEG comprimido
-  config.frame_size    = FRAMESIZE_QVGA; // Resolucion: 320x240 pixeles
-  config.jpeg_quality  = 12;             // Calidad JPEG (0=mejor, 63=peor)
-  config.fb_count      = 1;              // Un solo buffer de frame
+  config.pin_d0 = 5;  config.pin_d1 = 3;
+  config.pin_d2 = 2;  config.pin_d3 = 4;
+  config.pin_d4 = 6;  config.pin_d5 = 8;
+  config.pin_d6 = 9;  config.pin_d7 = 11;
+  config.pin_xclk     = 10;
+  config.pin_pclk     = 7;
+  config.pin_vsync    = 13;
+  config.pin_href     = 12;
+  config.pin_sccb_sda = 21;
+  config.pin_sccb_scl = 14;
+  config.pin_pwdn     = -1;
+  config.pin_reset    = -1;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
 
-  esp_err_t err = esp_camera_init(&config); // Intento inicializar la camara
+  // ============================================================
+  // FIX: "frame buffer malloc failed"
+  // El buffer de la foto necesita PSRAM (la RAM interna normal del
+  // ESP32-S3 es muy chica para un frame JPEG). Si la placa tiene
+  // PSRAM Y esta habilitada en Herramientas > PSRAM del Arduino IDE,
+  // psramFound() devuelve true y usamos 2 buffers en PSRAM para
+  // mas margen. Si no hay PSRAM disponible, bajamos calidad/tamano
+  // para que quepa en la RAM interna en vez de fallar.
+  // ============================================================
+  if (psramFound()) {
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.fb_count     = 2;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+    Serial.println("PSRAM detectada: usando 2 buffers en PSRAM.");
+  } else {
+    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.fb_count     = 1;
+    config.frame_size   = FRAMESIZE_QQVGA;  // 160x120: cabe en RAM interna
+    config.jpeg_quality = 15;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    Serial.println("AVISO: sin PSRAM. Resolucion reducida a QQVGA para que quepa en RAM interna.");
+    Serial.println("       Revisa Herramientas > PSRAM en el Arduino IDE (debe decir 'OPI PSRAM').");
+  }
+
+  esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) { Serial.printf("Error camara: 0x%x\n", err); return false; }
   Serial.println("Camara OK");
   return true;
 }
 
 // ============================================================
-// FUNCION: modoPrueba
-// Realiza un diagnostico completo del sistema al encender
-// Prueba todos los componentes: hardware, red, sensores, publicacion
-// Muestra un resumen final con el estado de cada componente
+// ENVÍO DE FOTOS POR HTTP:
+// En este apartado se agregó el envío de las fotos por medio de HTTP.
+// De esta forma se cambia el formato anterior para no enviarlas en Base64,
+// logrando un sistema mucho más ligero y menos exigente para el nodo.
 // ============================================================
-void modoPrueba() {
-  Serial.println("\n====================================");
-  Serial.println("        MODO PRUEBA ACTIVO          ");
-  Serial.println("====================================\n");
+void enviarFoto() {
+  Serial.println("Capturando foto...");
 
-  // --- PASO 1: HARDWARE ---
-  Serial.println("PASO 1/5: Inicializando hardware...");
+  camera_fb_t* warm = esp_camera_fb_get();   
+  if (warm) esp_camera_fb_return(warm);
+  delay(200);
 
-  // Enciendo el LED al inicio del modo prueba como indicador visual
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
-  Serial.println("  LED encendido (GPIO42 HIGH = 3.3V)");
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { Serial.println("Error: no se pudo obtener frame"); return; }
 
-  // Inicializo los pines de control del bus RS485 y el sensor
-  pinMode(DE_RE,       OUTPUT); digitalWrite(DE_RE, LOW);       // RS485 en modo recepcion
-  pinMode(PIN_CONTROL, OUTPUT); digitalWrite(PIN_CONTROL, LOW); // Sensor apagado por defecto
-
-  // Inicio los buses de comunicacion
-  Wire.begin(47, 36);     // Bus I2C en GPIO47 (SDA) y GPIO36 (SCL)
-  Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN); // RS485 a 9600 baudios
-  node.begin(1, Serial2); // El sensor Modbus tiene la direccion esclavo 1
-  node.preTransmission(preTransmission);   // Registro el callback de pre-transmision
-  node.postTransmission(postTransmission); // Registro el callback de post-transmision
-  dht.begin();   // Inicio el sensor DHT22
-  delay(2000);   // Espero 2 segundos para que el DHT se estabilice
-
-  // Inicializo el INA219 con calibracion para 16V maximos y 400mA maximos
-  bool ina_ok = ina219.begin();
-  if (ina_ok) ina219.setCalibration_16V_400mA(); // Rango de medicion apropiado para mi bateria
-  Serial.printf("  INA219 (bateria):  %s\n", ina_ok ? "OK" : "FALLO");
-
-  bool cam_ok = initCamera(); // Inicializo la camara OV2640
-  Serial.printf("  Camara OV2640:     %s\n", cam_ok ? "OK" : "FALLO");
-  Serial.println();
-
-  // --- PASO 2: RED ---
-  Serial.println("PASO 2/5: Conectando WiFi y MQTT...");
-  wifiConnect();
-  bool wifi_ok = (WiFi.status() == WL_CONNECTED);
-  Serial.printf("  WiFi (%s): %s\n", WIFI_SSID, wifi_ok ? "OK" : "FALLO");
-
-  bool mqtt_ok = false;
-  if (wifi_ok) {
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    mqtt.setCallback(callback);
-    mqtt.setBufferSize(2048);
-    mqttReconnect();
-    mqtt_ok = mqtt.connected();
+  if (!wifiConnect()) {
+    Serial.println("Sin WiFi, no se puede enviar la foto");
+    esp_camera_fb_return(fb);
+    ledBlink(1, 800, 0);
+    return;
   }
-  Serial.printf("  MQTT (%s:%d): %s\n", MQTT_HOST, MQTT_PORT, mqtt_ok ? "OK" : "FALLO");
-  if (mqtt_ok) { mqtt.loop(); delay(300); }
-  Serial.println();
 
-  // --- PASO 3: SENSOR DE SUELO ---
-  Serial.println("PASO 3/5: Leyendo sensor de suelo...");
-  digitalWrite(PIN_CONTROL, HIGH); // Enciendo la alimentacion del sensor
-  delay(2000);                     // Espero que el sensor se estabilice
-  leerSensor();
-  // Muestro los resultados en el monitor serial
-  Serial.printf("    pH          : %.2f\n",    isnan(ph)          ? 0 : ph);
-  Serial.printf("    Humedad     : %.1f %%\n", isnan(humedad)     ? 0 : humedad);
-  Serial.printf("    Temperatura : %.1f C\n",  isnan(temperatura) ? 0 : temperatura);
-  Serial.printf("    EC          : %u uS/cm\n", ec);
-  Serial.printf("    Nitrogeno   : %u mg/kg\n", nitrogeno);
-  Serial.printf("    Fosforo     : %u mg/kg\n", fosforo);
-  Serial.printf("    Potasio     : %u mg/kg\n", potasio);
-  digitalWrite(PIN_CONTROL, LOW); // Apago la alimentacion del sensor para ahorrar energia
-  Serial.println();
+  HTTPClient http;
+  String url = String(PHOTO_SERVER_URL) + "?nodo=" + NODO_ID + "&ts=" + String(millis());
+  http.begin(url);
+  http.addHeader("Content-Type", "image/jpeg");
+  http.setTimeout(10000);
 
-  // --- PASO 4: DHT22 Y BATERIA ---
-  Serial.println("PASO 4/5: Leyendo DHT22 y bateria...");
-  leerDHT();
-  leerBateria();
-  Serial.printf("  DHT22  -> Temp: %.1f C  Hum: %.1f %%\n", dht_t, dht_h);
-  Serial.printf("  Bateria-> %.2f V | %.2f mA | %.1f %%\n",
-                bat_voltaje, bat_corriente, bat_porcentaje);
-  Serial.println();
+  Serial.printf("Enviando foto (%d bytes) a %s ...\n", fb->len, url.c_str());
+  int httpCode = http.POST(fb->buf, fb->len);
 
-  // --- PASO 5: PUBLICAR DATOS Y FOTO ---
-  Serial.println("PASO 5/5: Publicando datos y foto por MQTT...");
-  if (mqtt_ok) {
-    publicarTodo();
-    mqtt.loop();
-    delay(500);
-    if (cam_ok) {
-      enviarFoto(); // Capturo y envio la foto si la camara funciona
-      // Mantengo el loop MQTT activo 3 segundos para completar el envio de fragmentos
-      unsigned long tf = millis();
-      while (millis() - tf < 3000) { mqtt.loop(); delay(10); }
-    } else {
-      Serial.println("  Foto omitida (camara no disponible)");
-    }
+  if (httpCode > 0) {
+    Serial.printf("Respuesta HTTP: %d\n", httpCode);
+    if (httpCode == 200) { Serial.println("Foto enviada correctamente"); ledBlink(2, 100, 100); }
+    else                 { Serial.println("Codigo distinto de 200");     ledBlink(4, 80, 80);   }
   } else {
-    Serial.println("  Publicacion omitida (sin conexion MQTT)");
+    Serial.printf("Error al enviar: %s\n", http.errorToString(httpCode).c_str());
+    ledBlink(1, 800, 0);
   }
 
-  // --- RESUMEN FINAL ---
-  Serial.println("\n====================================");
-  Serial.println("         RESUMEN DE PRUEBA          ");
-  Serial.println("====================================");
-  Serial.printf( "  INA219  : %s\n", ina_ok  ? "OK" : "FALLO");
-  Serial.printf( "  Camara  : %s\n", cam_ok  ? "OK" : "FALLO");
-  Serial.printf( "  WiFi    : %s\n", wifi_ok ? "OK" : "FALLO");
-  Serial.printf( "  MQTT    : %s\n", mqtt_ok ? "OK" : "FALLO");
-  Serial.printf( "  Bateria : %.2f V | %.1f %%\n", bat_voltaje, bat_porcentaje);
-  Serial.println("====================================");
-  Serial.println("\nPrueba finalizada.\n");
-
-  // Apago el LED al terminar el modo prueba
-  digitalWrite(LED_PIN, LOW);
-  Serial.println("  LED apagado (GPIO42 LOW = 0V)");
+  http.end();
+  esp_camera_fb_return(fb);
 }
 
 // ============================================================
-// FUNCION: cicloMedicion
-// Realiza un ciclo completo de medicion y publicacion
-// Se ejecuta cuando el ESP32 se despierta en una hora programada
-// Secuencia: inicializar hardware -> leer sensores -> publicar -> foto -> dormir
+// MODO CONFIG
+// Espera el JSON de horario de la interfaz. Sale con el boton o
+// por timeout (3 min) para no agotar la bateria si se olvida.
+// ============================================================
+void entrarModoConfig() {
+  modoConfig = true;
+  horarioRecibido = false;
+
+  Serial.println("\n=== MODO CONFIG ACTIVO ===");
+  Serial.printf("Publica en %s o %s -> {\"horas\":[10,18],\"minutos\":[30,0]}\n",
+                TOPIC_CONFIG, TOPIC_CFG_ALL);
+  Serial.println("Presiona el boton otra vez para salir.\n");
+
+  mqttConnect(5);
+  mqttPublish(TOPIC_STATUS, "config_on");
+
+  unsigned long inicio   = millis();
+  unsigned long tLed     = 0;
+  bool          ledOn    = false;
+  const unsigned long TIMEOUT_MS = 180000UL;   // 3 minutos
+
+  while (millis() - inicio < TIMEOUT_MS) {
+    if (!mqtt.connected()) mqttConnect(1);
+    mqtt.loop();                                // <-- ahora corre muy seguido
+
+    // Parpadeo lento no bloqueante (500/500)
+    if (millis() - tLed >= 500) {
+      tLed = millis();
+      ledOn = !ledOn;
+      digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+    }
+
+    // Aviso visual de horario recibido
+    if (horarioRecibido) {
+      horarioRecibido = false;
+      digitalWrite(LED_PIN, LOW);
+      ledBlink(5, 80, 80);                      // SEÑAL: horario guardado OK
+      Serial.println("Horario aplicado. Puedes salir con el boton.");
+    }
+
+    // Salida por boton
+    if (digitalRead(PIN_BOTON) == LOW) {
+      delay(50);
+      if (digitalRead(PIN_BOTON) == LOW) {
+        while (digitalRead(PIN_BOTON) == LOW) delay(10);
+        delay(60);
+        break;
+      }
+    }
+    delay(5);
+  }
+
+  digitalWrite(LED_PIN, LOW);
+  modoConfig = false;
+  mqttPublish(TOPIC_STATUS, "config_off");
+  Serial.println("Modo config desactivado.\n");
+}
+
+// ============================================================
+// DATOS SIMULADOS DE SENSORES
+// Genera valores aleatorios dentro de los rangos y los publica por
+// MQTT con el mismo JSON que espera la interfaz (igual al simulador
+// en Python). Reemplaza a leerSensor/leerDHT/leerBateria/publicarTodo
+// mientras no haya sensores fisicos.
+// ============================================================
+#ifdef SIMULAR_SENSORES
+
+// Float aleatorio en [minimo, maximo] usando el RNG por hardware
+static float randFloat(float minimo, float maximo) {
+  return minimo + (maximo - minimo) * ((esp_random() % 100001UL) / 100000.0f);
+}
+
+// Entero aleatorio en [minimo, maximo]
+static int randInt(int minimo, int maximo) {
+  return minimo + (int)(esp_random() % (uint32_t)(maximo - minimo + 1));
+}
+
+// La bateria simulada va bajando poco a poco entre ciclos (como en el .py)
+static float bateriaSimulada() {
+  if (bateriaSim < SIM_BAT_MIN || bateriaSim > SIM_BAT_MAX)
+    bateriaSim = randFloat(SIM_BAT_MIN, SIM_BAT_MAX);   // primer ciclo
+
+  bateriaSim -= randFloat(0.0f, 0.12f);                 // consumo lento
+  if (bateriaSim < 20.0f) bateriaSim += randFloat(0.5f, 2.0f);
+  if (bateriaSim < SIM_BAT_MIN) bateriaSim = SIM_BAT_MIN;
+  if (bateriaSim > SIM_BAT_MAX) bateriaSim = SIM_BAT_MAX;
+  return bateriaSim;
+}
+
+void publicarDatosSimulados() {
+  float dhtT   = randFloat(SIM_DHT_T_MIN, SIM_DHT_T_MAX);
+  float dhtH   = randFloat(SIM_DHT_H_MIN, SIM_DHT_H_MAX);
+  int   sN     = randInt(SIM_N_MIN, SIM_N_MAX);
+  int   sP     = randInt(SIM_P_MIN, SIM_P_MAX);
+  int   sK     = randInt(SIM_K_MIN, SIM_K_MAX);
+  float sHum   = randFloat(SIM_SHUM_MIN, SIM_SHUM_MAX);
+  float sTemp  = randFloat(SIM_STEMP_MIN, SIM_STEMP_MAX);
+  int   sEC    = randInt(SIM_EC_MIN, SIM_EC_MAX);
+  float sPH    = randFloat(SIM_PH_MIN, SIM_PH_MAX);
+  float bat    = bateriaSimulada();
+
+  char json[256];
+  snprintf(json, sizeof(json),
+    "{\"dht\":{\"t\":%.1f,\"h\":%.1f},"
+    "\"suelo\":{\"N\":%d,\"P\":%d,\"K\":%d,\"hum\":%.1f,\"temp\":%.1f,\"ec\":%d,\"ph\":%.2f},"
+    "\"bateria\":{\"porcentaje\":%.1f}}",
+    dhtT, dhtH, sN, sP, sK, sHum, sTemp, sEC, sPH, bat);
+
+  Serial.printf("Datos simulados -> %s\n  %s\n", TOPIC_DATA, json);
+
+  // Si el MQTT se cayo, un intento de reconexion
+  if (!mqtt.connected()) mqttConnect(2);
+
+  if (mqtt.connected()) {
+    bool ok = mqtt.publish(TOPIC_DATA, json);
+    mqtt.loop();
+    delay(120);
+    Serial.println(ok ? "Datos simulados publicados OK" : "Error al publicar datos simulados");
+  } else {
+    Serial.println("Sin MQTT: datos simulados no enviados");
+  }
+}
+#endif
+
+// ============================================================
+// CICLO DE MEDICION (foto + futuros sensores)
 // ============================================================
 void cicloMedicion() {
   Serial.println("Iniciando ciclo de medicion...");
-
-  // Enciendo el LED para indicar que estoy midiendo
-  pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
-  Serial.println("  LED encendido (midiendo)");
 
-  // Inicializo todos los pines y perifericos
-  pinMode(DE_RE,       OUTPUT); digitalWrite(DE_RE, LOW);
-  pinMode(PIN_CONTROL, OUTPUT); digitalWrite(PIN_CONTROL, LOW);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  bool cam_ok = initCamera();
 
-  Wire.begin(47, 36);   // Inicio el bus I2C
-  initCamera();         // Inicio la camara
+  // ---- Sensores deshabilitados ----
+  // leerSensor(); leerDHT(); leerBateria(); publicarTodo();
 
-  Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN); // Inicio RS485
-  node.begin(1, Serial2);
-  node.preTransmission(preTransmission);
-  node.postTransmission(postTransmission);
-
-  dht.begin();  // Inicio el DHT22
-  delay(2000);  // Espero que el DHT se estabilice
-
-  ina219.begin();                          // Inicio el INA219
-  ina219.setCalibration_16V_400mA();       // Calibro el rango de medicion
-
-  // Me conecto a WiFi y MQTT
-  wifiConnect();
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(callback);
-  mqtt.setBufferSize(2048);
-  mqttReconnect();
-
-  mqtt.loop(); delay(500); // Proceso mensajes entrantes (por si hay nuevo horario)
-
-  // Enciendo el sensor de suelo y espero que se estabilice
-  digitalWrite(PIN_CONTROL, HIGH);
-  delay(2000);
-
-  // Leo todos los sensores
-  leerSensor();
-  leerDHT();
-  leerBateria();
-
-  // Publico todos los datos por MQTT
-  publicarTodo();
-  mqtt.loop();
-
-  delay(500);
-  digitalWrite(PIN_CONTROL, LOW); // Apago el sensor de suelo para ahorrar energia
-
-  // Envio la foto por MQTT
-  enviarFoto();
-
-  // Mantengo el loop activo 3 segundos para asegurar que todos los fragmentos se envien
-  unsigned long tf = millis();
-  while (millis() - tf < 3000) { mqtt.loop(); delay(10); }
-
-  // Apago el LED al terminar el ciclo
-  digitalWrite(LED_PIN, LOW);
-  Serial.println("  LED apagado (ciclo terminado)");
-}
-
-// ============================================================
-// FUNCION: setup
-// Punto de entrada del programa - se ejecuta una vez al encender
-// o al salir de deep sleep
-// Logica principal:
-//   1. Inicializar LED y hacer test
-//   2. Conectar y saludar al broker MQTT
-//   3. Si esta activado, ejecutar el modo prueba
-//   4. Despedirse del broker MQTT
-//   5. Evaluar la causa del despertar (boton o temporizador)
-//   6. Ejecutar el ciclo de medicion si corresponde
-//   7. Entrar en deep sleep por 1 hora
-// ============================================================
-void setup() {
-  Serial.begin(115200); // Inicio la comunicacion serial para depuracion
-  delay(500);
-
-  // Inicializo el LED como primera accion para poder usarlo como indicador
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // Apagado por defecto
-
-  // Hago el test del LED con 3 parpadeos rapidos para verificar que el pin funciona
-  testLED();
-
-  // Configuro el boton con resistencia pull-up interna (activo en LOW cuando se presiona)
-  pinMode(PIN_BOTON, INPUT_PULLUP);
-
-  // --- Saludo inicial al broker MQTT ---
-  // Esto sirve para saber que el nodo esta activo y se desperto
-  wifiConnect();
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(callback);
-  mqtt.setBufferSize(2048);
-  mqttReconnect();
-  mqtt.publish("esp32/nodo2/status", "hola"); // Publico "hola" para avisar que desperte
-  mqtt.loop();
-  delay(300);
-
-  // --- MODO PRUEBA ---
-  // Comenta o elimina el #define MODO_PRUEBA para desactivar el modo prueba en produccion
-  #define MODO_PRUEBA  // Descomenta esta linea para activar el modo prueba
-
-  #ifdef MODO_PRUEBA
-    modoPrueba(); // Ejecuto el diagnostico completo
+  // v14: datos simulados (se publican justo antes de la foto)
+  #ifdef SIMULAR_SENSORES
+    publicarDatosSimulados();
   #endif
 
-  // --- Despedida al broker MQTT ---
-  // Reconecto porque modoPrueba puede haber cambiado el estado de la conexion
-  wifiConnect();
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(callback);
-  mqtt.setBufferSize(2048);
-  mqttReconnect();
-  mqtt.publish("esp32/nodo2/status", "chao"); // Aviso que voy a dormir
-  mqtt.loop();
-  delay(300);
+  if (cam_ok) enviarFoto();
+  else Serial.println("Foto omitida (camara no disponible)");
 
-  // Leo la causa del ultimo despertar del deep sleep
-  esp_sleep_wakeup_cause_t causa = esp_sleep_get_wakeup_cause();
-
-  // ============================================================
-  // CASO 1: DESPERTAR POR BOTON (pin externo EXT0)
-  // El usuario presiono el boton para configurar el horario
-  // ============================================================
-  if (causa == ESP_SLEEP_WAKEUP_EXT0) {
-
-    // Espero a que el usuario suelte el boton (anti-rebote)
-    while (digitalRead(PIN_BOTON) == LOW) { delay(10); }
-    delay(60); // Pausa adicional anti-rebote
-
-    if (!modoConfig) {
-      // Si el modo config no estaba activo, lo activo ahora
-      modoConfig = true;
-      Serial.println("\nMODO CONFIG: Activado.");
-      Serial.println("   Publica en esp32/config -> {\"horas\":[6,12,18]}");
-      Serial.println("   Presiona el boton de nuevo para salir.\n");
-
-      // Me conecto y espero mensajes de configuracion
-      wifiConnect();
-      mqtt.setServer(MQTT_HOST, MQTT_PORT);
-      mqtt.setCallback(callback);
-      mqttReconnect();
-
-      // Bucle de espera: proceso MQTT y parpadeo el LED hasta que presionen el boton de nuevo
-      while (true) {
-        mqtt.loop(); // Recibo el mensaje de horario si llega
-
-        // Parpadeo el LED con periodo lento para indicar modo configuracion activo
-        digitalWrite(LED_PIN, HIGH); delay(500);
-        digitalWrite(LED_PIN, LOW);  delay(500);
-
-        // Verifico si el usuario presiono el boton para salir del modo config
-        if (digitalRead(PIN_BOTON) == LOW) {
-          while (digitalRead(PIN_BOTON) == LOW) { delay(10); } // Espero que lo suelte
-          delay(60); // Anti-rebote
-          modoConfig = false;
-          digitalWrite(LED_PIN, LOW);
-          Serial.println("\nModo config desactivado. Entrando en deep sleep...");
-          break; // Salgo del bucle de espera
-        }
-      }
-
-    } else {
-      // Si el modo config ya estaba activo, este segundo boton lo desactiva
-      modoConfig = false;
-      Serial.println("\nModo config desactivado. Entrando en deep sleep...");
-    }
-  }
-
-  // ============================================================
-  // CASO 2: DESPERTAR POR TEMPORIZADOR o primer arranque
-  // El ESP32 se desperto porque paso 1 hora - verifico si debo medir
-  // ============================================================
-  else {
-    Wire.begin(47, 36); // Inicio I2C para leer el RTC
-    rtc.begin();        // Inicio el modulo de reloj
-    DateTime now        = rtc.now();        // Leo la hora actual del RTC DS3231
-    int      horaActual = now.hour();       // Extraigo solo la hora (0-23)
-
-    Serial.printf("\nTIMER: Hora actual: %02d:%02d\n", horaActual, now.minute());
-
-    if (numHoras == 0) {
-      // No tengo horario configurado, aviso al usuario
-      Serial.println("Sin horario configurado. Usa el boton para programar.");
-    } else if (esHoraDeMedir(horaActual)) {
-      // La hora actual esta en el horario, ejecuto el ciclo de medicion
-      Serial.printf("Hora %d esta en el horario -> tomando medidas.\n", horaActual);
-      cicloMedicion();
-    } else {
-      // La hora actual no esta en el horario, vuelvo a dormir sin medir
-      Serial.printf("Hora %02d NO esta en el horario -> volviendo a dormir.\n", horaActual);
-    }
-  }
-
-  // ============================================================
-  // DEEP SLEEP: entro en modo de bajo consumo por 1 hora
-  // Configuro dos fuentes de despertar:
-  //   1. Temporizador de 1 hora (para revisar el horario)
-  //   2. Pin del boton en nivel bajo (para el modo configuracion)
-  // ============================================================
-  Serial.println("Durmiendo 1 hora...");
-  Serial.flush(); // Aseguro que el serial se vacio antes de dormir
-
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BOTON, 0); // Despertar si el boton esta en LOW
-  esp_sleep_enable_timer_wakeup(3600ULL * 1000000ULL);     // Despertar despues de 3600 segundos
-  esp_deep_sleep_start(); // El programa se detiene aqui hasta el proximo despertar
+  digitalWrite(LED_PIN, LOW);
+  ultimaMedicion = rtc.now().unixtime();   // v13: anti-doble-foto
+  Serial.println("Ciclo terminado.");
 }
 
 // ============================================================
-// FUNCION: loop
-// No se usa porque el ESP32 siempre entra en deep sleep al final
-// de setup(). Despues de cada ciclo, el chip se resetea y vuelve
-// a ejecutar setup() desde el principio.
+// MODO PRUEBA
+// ============================================================
+void modoPrueba() {
+  Serial.println("\n===== MODO PRUEBA =====");
+  digitalWrite(LED_PIN, HIGH);
+
+  // Diagnostico de PSRAM (relacionado con el fix de la camara)
+  Serial.printf("  PSRAM detectada : %s\n", psramFound() ? "SI" : "NO");
+  if (psramFound())
+    Serial.printf("  PSRAM libre     : %u KB\n", ESP.getFreePsram() / 1024);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  bool rtc_ok = rtc.begin();
+  Serial.printf("  RTC DS3231 : %s\n", rtc_ok ? "OK" : "FALLO");
+  if (rtc_ok) {
+    DateTime now = rtc.now();
+    Serial.printf("  Hora RTC   : %04d-%02d-%02d %02d:%02d:%02d\n",
+                  now.year(), now.month(), now.day(),
+                  now.hour(), now.minute(), now.second());
+    if (rtc.lostPower())
+      Serial.println("  AVISO: el RTC perdio la hora. Manda una config desde la interfaz para sincronizarlo.");
+  }
+
+  bool cam_ok = initCamera();
+  Serial.printf("  Camara     : %s\n", cam_ok ? "OK" : "FALLO");
+  Serial.printf("  WiFi       : %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "FALLO");
+  Serial.printf("  MQTT       : %s\n", mqtt.connected() ? "OK" : "FALLO");
+
+  #ifdef SIMULAR_SENSORES
+    publicarDatosSimulados();    // v14
+  #endif
+
+  if (cam_ok) enviarFoto();
+
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("===== FIN PRUEBA =====\n");
+}
+
+// ============================================================
+// DEEP SLEEP
+// ============================================================
+void dormir(uint64_t segundos) {
+  Serial.printf("Durmiendo %llu s (%.1f min)...\n", segundos, segundos / 60.0);
+  Serial.flush();
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  digitalWrite(LED_PIN, LOW);
+
+  // Pull-up del boton mantenido durante el deep sleep (imprescindible)
+  rtc_gpio_pullup_en((gpio_num_t)PIN_BOTON);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIN_BOTON);
+
+  // Si el boton quedo presionado, espero a que lo suelten para no
+  // despertar de inmediato en un bucle.
+  while (digitalRead(PIN_BOTON) == LOW) delay(10);
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BOTON, 0);  // LOW = presionado
+  esp_sleep_enable_timer_wakeup(segundos * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// ============================================================
+// VOID SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+
+  // El pin sale del estado de deep sleep "congelado": lo libero
+  rtc_gpio_deinit((gpio_num_t)PIN_BOTON);
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+
+  esp_sleep_wakeup_cause_t causa = esp_sleep_get_wakeup_cause();
+  Serial.printf("\n=== NODO %s ===  causa de despertar: %d\n", NODO_ID, (int)causa);
+
+  testLED();                                   // 3 parpadeos
+
+  //  I2C + RTC ANTES de la red
+  Wire.begin(I2C_SDA, I2C_SCL);
+  bool rtcOk = rtc.begin();
+  Serial.printf("RTC DS3231: %s\n", rtcOk ? "OK" : "FALLO");
+  if (rtcOk) {
+    DateTime t = rtc.now();
+    Serial.printf("Hora RTC al despertar: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
+  }
+
+  // --- Red ---
+  wifiConnect();
+  mqttConnect(3);
+  mqttPublish(TOPIC_STATUS, "hola");
+  // Da tiempo a que llegue el horario retenido del broker
+  for (int i = 0; i < 10; i++) { mqtt.loop(); delay(50); }
+
+  // ============================================================
+  // ¿Hay que entrar a MODO CONFIG?
+  //   a) desperto por el boton (EXT0), o
+  //   b) primer arranque / reset y el usuario presiona el boton
+  //      en la ventana de 4 s
+  // ============================================================
+  bool entrarConfig = (causa == ESP_SLEEP_WAKEUP_EXT0);
+
+  if (!entrarConfig && causa != ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("Ventana de 4 s: presiona el boton para entrar a MODO CONFIG...");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 4000) {
+      ledBlink(2, 60, 60); delay(300);         // parpadeo doble = ventana abierta
+      if (digitalRead(PIN_BOTON) == LOW) { entrarConfig = true; break; }
+      mqtt.loop();
+    }
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  if (entrarConfig) {
+    while (digitalRead(PIN_BOTON) == LOW) delay(10);   // antirrebote
+    delay(60);
+    entrarModoConfig();
+  }
+  else {
+    // ------- Despertar normal: ¿toca medir? -------
+    DateTime now = rtc.now();
+    Serial.printf("Hora RTC: %02d:%02d:%02d\n", now.hour(), now.minute(), now.second());
+
+    #ifdef MODO_PRUEBA
+      modoPrueba();
+    #else
+      if (numHoras == 0) {
+        Serial.println("Sin horario configurado. Usa el boton + la interfaz.");
+      } else {
+        int idx = horarioActivo(now);
+        if (idx >= 0) {
+          Serial.printf("Toca medir (horario %02d:%02d).\n", horasConfig[idx], minutosConfig[idx]);
+          esperarHoraExacta(idx);            // v13: foto a la hora exacta
+          cicloMedicion();
+        } else {
+          Serial.println("No toca medir -> a dormir.");
+        }
+      }
+    #endif
+  }
+
+  // --- Despedida ---
+  if (!mqtt.connected()) mqttConnect(2);
+  mqttPublish(TOPIC_STATUS, "chao");
+
+  // --- Dormir hasta el proximo horario ---
+  DateTime ahora = rtc.now();
+  uint64_t segs  = segundosDeSueno(ahora);
+  dormir(segs);
+}
+
+// ============================================================
+// VOID LOOP
 // ============================================================
 void loop() {}
