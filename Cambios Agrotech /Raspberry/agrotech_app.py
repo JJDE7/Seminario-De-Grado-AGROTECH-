@@ -104,6 +104,79 @@ C = {
 # ══════════════════════════════════════════════════════════════════════
 #  SQLITE — ALMACENAMIENTO HISTÓRICO
 # ══════════════════════════════════════════════════════════════════════
+def sqlite_importar_fotos_existentes():
+    """
+    Importa a SQLite las fotografías JPG históricas que ya existen en
+    ~/agrotech/data y que todavía no tienen un registro en la tabla fotos.
+
+    Solo reconoce nombres generados por AgroTech:
+        cam_nodo1_YYYYMMDD_HHMMSS.jpg
+        cam_nodo1_YYYYMMDD_HHMMSS_ffffff.jpg
+
+    Las fotos importadas quedan con enviado=0 para que la sincronización
+    con la nube pueda enviarlas también.
+    """
+    import re
+    import glob
+
+    patron = re.compile(
+        r"^cam_(nodo[1-4])_(\d{8})_(\d{6})(?:_\d{6})?\.jpg$",
+        re.IGNORECASE
+    )
+
+    try:
+        archivos = glob.glob(os.path.join(DATA_DIR, "cam_nodo*.jpg"))
+        importadas = 0
+
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            for ruta in sorted(archivos):
+                nombre = os.path.basename(ruta)
+                match = patron.match(nombre)
+                if not match:
+                    continue
+
+                nodo_id, fecha, hora = match.groups()
+                timestamp = datetime.strptime(
+                    f"{fecha}_{hora}", "%Y%m%d_%H%M%S"
+                ).strftime("%Y-%m-%d %H:%M:%S")
+
+                # Si ya existe una foto con ese nodo y timestamp, no se duplica.
+                existe = conn.execute("""
+                    SELECT id FROM fotos
+                    WHERE nodo_id = ? AND timestamp = ?
+                    LIMIT 1
+                """, (nodo_id, timestamp)).fetchone()
+                if existe:
+                    continue
+
+                with open(ruta, "rb") as f:
+                    imagen = f.read()
+
+                if not imagen:
+                    continue
+
+                conn.execute("""
+                    INSERT INTO fotos
+                        (nodo_id, timestamp, imagen, tam_bytes, enviado)
+                    VALUES (?, ?, ?, ?, 0)
+                """, (
+                    nodo_id,
+                    timestamp,
+                    sqlite3.Binary(imagen),
+                    len(imagen)
+                ))
+                importadas += 1
+
+            conn.commit()
+
+        if importadas:
+            print(f"[SQLITE] Fotos históricas importadas desde carpeta: {importadas}")
+            solicitar_sincronizacion() if '_sync_event' in globals() else None
+
+    except Exception as e:
+        print(f"[SQLITE] Error importando fotos históricas: {e}")
+
+
 def sqlite_iniciar():
     """Crea la base de datos y la tabla de mediciones si no existen."""
     try:
@@ -131,14 +204,53 @@ def sqlite_iniciar():
                 CREATE INDEX IF NOT EXISTS idx_mediciones_nodo_fecha
                 ON mediciones(nodo_id, timestamp)
             """)
+            # Tabla histórica de fotografías.
+            # Cada foto tiene su propio ID, por lo que un nodo puede tener
+            # tantas fotografías como sean necesarias.
+            columnas_fotos_existentes = {row[1] for row in conn.execute(
+                "PRAGMA table_info(fotos)").fetchall()}
+
+            if columnas_fotos_existentes and "id" not in columnas_fotos_existentes:
+                # Migración de la versión anterior: allí nodo_id era PRIMARY KEY
+                # y solo podía existir una foto por nodo. Conservamos esas
+                # últimas fotos y las pasamos al nuevo esquema histórico.
+                conn.execute("ALTER TABLE fotos RENAME TO fotos_legacy")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS fotos (
-                    nodo_id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nodo_id TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
                     imagen BLOB NOT NULL,
-                    tam_bytes INTEGER NOT NULL
+                    tam_bytes INTEGER NOT NULL,
+                    enviado INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(nodo_id, timestamp)
                 )
             """)
+
+            if columnas_fotos_existentes and "id" not in columnas_fotos_existentes:
+                # Copiar la última foto que existía en el esquema antiguo.
+                columnas_legacy = {row[1] for row in conn.execute(
+                    "PRAGMA table_info(fotos_legacy)").fetchall()}
+                tiene_enviado = "enviado" in columnas_legacy
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO fotos
+                        (nodo_id, timestamp, imagen, tam_bytes, enviado)
+                    SELECT nodo_id, timestamp, imagen, tam_bytes,
+                           {"enviado" if tiene_enviado else "0"}
+                    FROM fotos_legacy
+                """)
+                conn.execute("DROP TABLE fotos_legacy")
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fotos_nodo_fecha
+                ON fotos(nodo_id, timestamp)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fotos_enviado
+                ON fotos(enviado, id)
+            """)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS configuraciones (
                     nodo_id TEXT PRIMARY KEY,
@@ -156,23 +268,13 @@ def sqlite_iniciar():
                     "ALTER TABLE mediciones ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
                 )
 
-            columnas_foto = {row[1] for row in conn.execute(
-                "PRAGMA table_info(fotos)").fetchall()}
-            if "enviado" not in columnas_foto:
-                conn.execute(
-                    "ALTER TABLE fotos ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
-                )
-
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_mediciones_enviado
                 ON mediciones(enviado, id)
             """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_fotos_enviado
-                ON fotos(enviado, nodo_id)
-            """)
             conn.commit()
         print(f"[SQLITE] Base de datos lista: {SQLITE_DB}")
+        sqlite_importar_fotos_existentes()
         return True
     except Exception as e:
         print(f"[SQLITE] Error inicializando: {e}")
@@ -313,102 +415,124 @@ def sqlite_marcar_medicion_enviada(id_medicion):
         )
         conn.commit()
 
-def sqlite_fotos_pendientes():
+def sqlite_fotos_pendientes(limite=100):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         return conn.execute("""
-            SELECT nodo_id, timestamp, imagen, tam_bytes
+            SELECT id, nodo_id, timestamp, imagen, tam_bytes
             FROM fotos
             WHERE enviado = 0
-            ORDER BY timestamp ASC
-        """).fetchall()
+            ORDER BY id ASC
+            LIMIT ?
+        """, (limite,)).fetchall()
 
-def sqlite_marcar_foto_enviada(nodo_id, timestamp):
+def sqlite_marcar_foto_enviada(id_foto):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         conn.execute("""
             UPDATE fotos SET enviado = 1
-            WHERE nodo_id = ? AND timestamp = ?
-        """, (nodo_id, timestamp))
+            WHERE id = ?
+        """, (id_foto,))
         conn.commit()
 
 def solicitar_sincronizacion():
     _sync_event.set()
 
 def sincronizar_con_nube():
-    """Envía solo pendientes y confirma cada elemento individualmente."""
+    """
+    Envía todos los registros pendientes que pueda mientras haya conexión.
+
+    - enviado=0: pendiente.
+    - enviado=1: confirmado por la nube.
+    - Si falla la conexión o la nube rechaza un elemento, ese elemento queda
+      en 0 y se detiene el ciclo actual para reintentarlo más tarde.
+    - Cuando la conexión funciona, se procesan lotes sucesivos hasta que no
+      queden mediciones ni fotos pendientes.
+    """
     if not CLOUD_SERVER_URL or "TU-DOMINIO" in CLOUD_SERVER_URL:
+        print("[SYNC] CLOUD_SERVER_URL no está configurada; sincronización omitida.")
         return
 
-    for id_local, nodo_id, timestamp, payload in sqlite_mediciones_pendientes():
-        try:
-            datos_originales = json.loads(payload)
-            # La bandera es estrictamente local y nunca viaja a la nube.
-            datos_originales.pop("enviado", None)
+    print("[SYNC] Comprobando datos y fotos pendientes...")
 
-            # El ESP32/Raspberry guarda localmente solo dht/suelo/bateria,
-            # pero la API de la nube exige además tipo, nodo_id y timestamp.
-            # Construimos aquí el formato del contrato de la nube sin alterar
-            # el payload original almacenado en SQLite.
-            datos = {
-                "tipo": "lectura",
-                "nodo_id": nodo_id,
-                "timestamp": timestamp,
-                **datos_originales,
-            }
-
-            numero_nodo = nodo_id.replace("nodo", "", 1)
-            respuesta = requests.post(
-                _cloud_url(f"/api/nodos/{numero_nodo}/datos"),
-                json=datos,
-                headers=_cloud_headers(),
-                timeout=CLOUD_TIMEOUT
-            )
-
-            if not respuesta.ok:
-                print(f"[SYNC] HTTP {respuesta.status_code} medición {id_local}: {respuesta.text[:300]}")
-                break
-
-            cuerpo = respuesta.json()
-            if cuerpo.get("ok") is True:
-                sqlite_marcar_medicion_enviada(id_local)
-                print(f"[SYNC] Medición local {id_local} confirmada por nube.")
-            else:
-                print(f"[SYNC] Nube rechazó medición {id_local}: {cuerpo}")
-                break
-
-        except Exception as e:
-            print(f"[SYNC] Error enviando medición {id_local}: {e}")
+    # Primero vaciamos todas las mediciones pendientes.
+    while True:
+        pendientes = sqlite_mediciones_pendientes(limite=100)
+        if not pendientes:
             break
 
-    for nodo_id, timestamp, imagen, tam_bytes in sqlite_fotos_pendientes():
-        try:
-            numero_nodo = nodo_id.replace("nodo", "", 1)
-            respuesta = requests.post(
-                _cloud_url(f"/api/nodos/{numero_nodo}/foto"),
-                params={"timestamp": timestamp},
-                data=imagen,
-                headers={
-                    "X-API-Key": CLOUD_API_KEY,
-                    "Content-Type": "image/jpeg",
-                    "X-Foto-Timestamp": timestamp,
-                },
-                timeout=CLOUD_TIMEOUT
-            )
+        for id_local, nodo_id, timestamp, payload in pendientes:
+            try:
+                datos_originales = json.loads(payload)
+                datos_originales.pop("enviado", None)
 
-            if not respuesta.ok:
-                print(f"[SYNC] HTTP {respuesta.status_code} foto {nodo_id}: {respuesta.text[:300]}")
-                break
+                datos = {
+                    "tipo": "lectura",
+                    "nodo_id": nodo_id,
+                    "timestamp": timestamp,
+                    **datos_originales,
+                }
 
-            cuerpo = respuesta.json()
-            if cuerpo.get("ok") is True:
-                sqlite_marcar_foto_enviada(nodo_id, timestamp)
-                print(f"[SYNC] Foto de {nodo_id} confirmada por nube.")
-            else:
-                print(f"[SYNC] Nube rechazó foto de {nodo_id}: {cuerpo}")
-                break
+                numero_nodo = nodo_id.replace("nodo", "", 1)
+                respuesta = requests.post(
+                    _cloud_url(f"/api/nodos/{numero_nodo}/datos"),
+                    json=datos,
+                    headers=_cloud_headers(),
+                    timeout=CLOUD_TIMEOUT
+                )
 
-        except Exception as e:
-            print(f"[SYNC] Error enviando foto de {nodo_id}: {e}")
+                if not respuesta.ok:
+                    print(f"[SYNC] HTTP {respuesta.status_code} medición {id_local}: {respuesta.text[:300]}")
+                    return
+
+                cuerpo = respuesta.json()
+                if cuerpo.get("ok") is True:
+                    sqlite_marcar_medicion_enviada(id_local)
+                    print(f"[SYNC] Medición local {id_local} confirmada por nube.")
+                else:
+                    print(f"[SYNC] Nube rechazó medición {id_local}: {cuerpo}")
+                    return
+
+            except Exception as e:
+                print(f"[SYNC] Error enviando medición {id_local}: {e}")
+                return
+
+    # Después vaciamos todas las fotografías pendientes.
+    while True:
+        pendientes = sqlite_fotos_pendientes(limite=25)
+        if not pendientes:
             break
+
+        for id_foto, nodo_id, timestamp, imagen, tam_bytes in pendientes:
+            try:
+                numero_nodo = nodo_id.replace("nodo", "", 1)
+                respuesta = requests.post(
+                    _cloud_url(f"/api/nodos/{numero_nodo}/foto"),
+                    params={"timestamp": timestamp},
+                    data=imagen,
+                    headers={
+                        "X-API-Key": CLOUD_API_KEY,
+                        "Content-Type": "image/jpeg",
+                        "X-Foto-Timestamp": timestamp,
+                    },
+                    timeout=CLOUD_TIMEOUT
+                )
+
+                if not respuesta.ok:
+                    print(f"[SYNC] HTTP {respuesta.status_code} foto local {id_foto} ({nodo_id}): {respuesta.text[:300]}")
+                    return
+
+                cuerpo = respuesta.json()
+                if cuerpo.get("ok") is True:
+                    sqlite_marcar_foto_enviada(id_foto)
+                    print(f"[SYNC] Foto local {id_foto} de {nodo_id} confirmada por nube.")
+                else:
+                    print(f"[SYNC] Nube rechazó foto local {id_foto} de {nodo_id}: {cuerpo}")
+                    return
+
+            except Exception as e:
+                print(f"[SYNC] Error enviando foto local {id_foto} de {nodo_id}: {e}")
+                return
+
+    print("[SYNC] Sincronización completada: no quedan pendientes.")
 
 def sincronizador_iniciar():
     def _run():
@@ -954,7 +1078,9 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
     ahora recibe directamente los bytes binarios del POST HTTP.
     """
     try:
-        nombre  = f"cam_{nodo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        # Microsegundos para evitar que dos fotos del mismo nodo recibidas
+        # durante el mismo segundo sobrescriban el archivo anterior.
+        nombre  = f"cam_{nodo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
         ruta_jpg = os.path.join(DATA_DIR, nombre)
         with open(ruta_jpg, "wb") as f:
             f.write(img_bytes)
@@ -965,18 +1091,22 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
         tam_kb    = len(img_bytes) // 1024
         timestamp_foto = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # ── Persistir la última foto en SQLite (fuente de la API REST) ──
+        # ── Persistir TODAS las fotos en SQLite ──
+        # Cada foto obtiene una fila propia y queda pendiente (enviado=0)
+        # hasta que la nube confirme su recepción.
         try:
             with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-                conn.execute("""
-                    INSERT INTO fotos (nodo_id, timestamp, imagen, tam_bytes)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(nodo_id) DO UPDATE SET
-                        timestamp=excluded.timestamp,
+                cursor = conn.execute("""
+                    INSERT INTO fotos (nodo_id, timestamp, imagen, tam_bytes, enviado)
+                    VALUES (?, ?, ?, ?, 0)
+                    ON CONFLICT(nodo_id, timestamp) DO UPDATE SET
                         imagen=excluded.imagen,
-                        tam_bytes=excluded.tam_bytes
+                        tam_bytes=excluded.tam_bytes,
+                        enviado=0
                 """, (nodo_id, timestamp_foto, sqlite3.Binary(img_bytes), len(img_bytes)))
+                id_foto = cursor.lastrowid
                 conn.commit()
+            print(f"[SQLITE] Foto {id_foto or 'existente'} de {nodo_id} guardada en historial.")
             solicitar_sincronizacion()
         except Exception as e:
             print(f"[SQLITE] Error guardando foto de {nodo_id}: {e}")
@@ -1179,7 +1309,10 @@ def _foto_sqlite(nodo_id):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         return conn.execute("""
             SELECT timestamp, imagen, tam_bytes
-            FROM fotos WHERE nodo_id = ?
+            FROM fotos
+            WHERE nodo_id = ?
+            ORDER BY id DESC
+            LIMIT 1
         """, (nodo_id,)).fetchone()
 
 
@@ -1203,6 +1336,28 @@ def api_foto_meta(nodo_id: str):
     if row is None:
         raise HTTPException(status_code=404, detail="El nodo todavía no tiene fotografías")
     return {"nodo_id": nodo_id, "timestamp": row[0], "tam_bytes": row[2]}
+
+
+@app.get("/api/nodos/{nodo_id}/fotos/historial")
+def api_historial_fotos(nodo_id: str, limite: int = 100):
+    _validar_nodo(nodo_id)
+    limite = max(1, min(limite, 5000))
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        rows = conn.execute("""
+            SELECT id, timestamp, tam_bytes, enviado
+            FROM fotos
+            WHERE nodo_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (nodo_id, limite)).fetchall()
+    return {
+        "nodo_id": nodo_id,
+        "cantidad": len(rows),
+        "fotos": [
+            {"id": r[0], "timestamp": r[1], "tam_bytes": r[2], "enviado": r[3]}
+            for r in rows
+        ]
+    }
 
 
 @app.get("/api/nodos/{nodo_id}/config")
