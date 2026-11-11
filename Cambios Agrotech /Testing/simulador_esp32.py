@@ -133,6 +133,18 @@ RANGES = {
 node_state = {}
 state_lock = threading.Lock()
 
+# Configuración recibida desde AgroTech.
+# Se conserva por separado para poder ver en el CMD qué horario
+# tiene aplicado cada nodo simulado.
+received_config = {}
+config_lock = threading.Lock()
+
+for node_id in SIMULATED_NODES:
+    received_config[node_id] = {
+        "horarios": [],
+        "ultima_configuracion": None,
+    }
+
 
 def crear_estado_nodo(nodo_id):
     """Crea valores iniciales realistas para un nodo."""
@@ -236,25 +248,121 @@ def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=No
     print(f"[MQTT] Desconectado. reason_code={reason_code}")
 
 
+def _reconstruir_horarios_config(config):
+    """
+    Reconstruye los horarios HH:MM usando el JSON que actualmente
+    envía AgroTech:
+
+        {
+            "horas": [10, 18],
+            "minutos": [30, 0]
+        }
+
+    También acepta el formato antiguo donde solo existía "horas".
+    """
+    horas = config.get("horas")
+    minutos = config.get("minutos")
+
+    if not isinstance(horas, list):
+        raise ValueError("El campo 'horas' no es una lista.")
+
+    # Formato nuevo: ambas listas deben corresponder posición a posición.
+    if isinstance(minutos, list):
+        if len(horas) != len(minutos):
+            raise ValueError(
+                f"'horas' tiene {len(horas)} elementos y "
+                f"'minutos' tiene {len(minutos)}."
+            )
+
+        horarios = []
+        for h, m in zip(horas, minutos):
+            h = int(h)
+            m = int(m)
+
+            if not (0 <= h <= 23):
+                raise ValueError(f"Hora fuera de rango: {h}")
+            if not (0 <= m <= 59):
+                raise ValueError(f"Minuto fuera de rango: {m}")
+
+            horarios.append(f"{h:02d}:{m:02d}")
+
+        return horarios
+
+    # Compatibilidad con el formato anterior: horas enteras => HH:00.
+    horarios = []
+    for h in horas:
+        h = int(h)
+        if not (0 <= h <= 23):
+            raise ValueError(f"Hora fuera de rango: {h}")
+        horarios.append(f"{h:02d}:00")
+
+    return horarios
+
+
 def on_message(client, userdata, msg):
-    """Muestra en consola las configuraciones recibidas desde AgroTech."""
+    """
+    Emula la recepción que tendría un ESP32 cuando AgroTech publica
+    una nueva configuración por MQTT.
+
+    AgroTech publica actualmente el JSON en:
+        esp32/config
+
+    El JSON contiene las listas paralelas 'horas' y 'minutos'.
+    """
+    print()
+    print("=" * 70)
+    print("[ESP32] MENSAJE RECIBIDO DESDE AGROTECH")
+    print("=" * 70)
+    print(f"[ESP32] Topic   : {msg.topic}")
+
     try:
         payload = msg.payload.decode("utf-8")
     except UnicodeDecodeError:
-        payload = repr(msg.payload)
+        print("[ESP32] Error: el mensaje no contiene UTF-8 válido.")
+        print("=" * 70)
+        return
 
-    print(f"[CONFIG] Recibido en {msg.topic}: {payload}")
+    print(f"[ESP32] JSON    : {payload}")
 
     try:
         config = json.loads(payload)
-        horas = config.get("horas")
-        if isinstance(horas, list):
-            print(
-                "[CONFIG] Horario del nodo actualizado: "
-                + ", ".join(f"{int(h)}:00" for h in horas)
-            )
-    except Exception:
-        pass
+
+        if not isinstance(config, dict):
+            raise ValueError("El JSON recibido no es un objeto.")
+
+        horarios = _reconstruir_horarios_config(config)
+
+        # AgroTech no incluye nodo_id en este JSON; el topic también es
+        # global (esp32/config). Por ello, en este simulador la orden se
+        # considera un broadcast y se aplica a todos los nodos simulados.
+        ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with config_lock:
+            for node_id in SIMULATED_NODES:
+                received_config[node_id] = {
+                    "horarios": horarios.copy(),
+                    "ultima_configuracion": ahora,
+                }
+
+        print("[ESP32] Configuración JSON válida.")
+        print(
+            "[ESP32] Horarios reconstruidos: "
+            + ", ".join(horarios)
+        )
+        print(
+            "[ESP32] Configuración aplicada a los nodos simulados: "
+            + ", ".join(SIMULATED_NODES)
+        )
+        print(f"[ESP32] Hora de recepción: {ahora}")
+
+    except json.JSONDecodeError as exc:
+        print(f"[ESP32] Error: JSON inválido: {exc}")
+    except (TypeError, ValueError) as exc:
+        print(f"[ESP32] Error procesando configuración: {exc}")
+    except Exception as exc:
+        print(f"[ESP32] Error inesperado procesando configuración: {exc}")
+
+    print("=" * 70)
 
 
 def iniciar_mqtt():
@@ -454,6 +562,8 @@ def comprobar_configuracion():
     print(f"Nodos simulados: {', '.join(SIMULATED_NODES)}")
     print(f"Intervalo MQTT: {SENSOR_INTERVAL_SECONDS}s")
     print(f"Intervalo HTTP: {PHOTO_INTERVAL_SECONDS}s")
+    print("Recepción MQTT: esp32/config")
+    print('Formato esperado: {"horas":[...],"minutos":[...]}')
     print()
 
     if not os.path.isdir(IMAGE_DIR):
