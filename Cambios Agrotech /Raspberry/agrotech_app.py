@@ -1,10 +1,12 @@
 """
 AgroTech Dashboard — Compatible con Flet 0.84+
-v3.0 — Cambios principales:
+v3.1 — Cambios principales:
 - Suscripción simultánea a todos los nodos desde el inicio
 - Navegación por ventanas sin scroll táctil
 - Horarios personalizables
 - Historial paginado (10 registros por página)
+- NUEVO: Recepción de fotografías por HTTP (reemplaza MQTT+Base64).
+  MQTT se conserva para sensores, status y configuración de horario.
 """
 
 import flet as ft
@@ -16,20 +18,28 @@ import urllib.request
 import os
 from datetime import datetime
 from typing import Optional
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 # ══════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════════
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
+
+# NUEVO: servidor HTTP que recibe las fotos enviadas por la ESP32-S3 CAM.
+# Debe coincidir con PHOTO_SERVER_URL configurado en el firmware del nodo.
+HTTP_PHOTO_PORT = 8080
+HTTP_PHOTO_PATH = "/upload"
+
 DATA_DIR    = os.path.expanduser("~/agrotech/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 NODOS = [
     {"id":"nodo1","nombre":"Nodo 1 · Parcela A","topic":"esp32/nodo1/data","camera_ip":"192.168.137.20","activo":True},
-    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":"192.168.137.21","activo":True},
-    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":None,"activo":True},
-    {"id":"nodo4","nombre":"Nodo 4 · Reserva","topic":"esp32/nodo4/data","camera_ip":None,"activo":False},
+    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":None,"activo":False}, #Aqui se desactivo manualmente el nodo
+    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":None,"activo":False}, #Aqui se desactivo manualmente el nodo
+    {"id":"nodo4","nombre":"Nodo 4 · Reserva","topic":"esp32/nodo4/data","camera_ip":None,"activo":False},   #Aqui se desactivo manualmente el nodo
 ]
 
 # ══════════════════════════════════════════════════════════════════════
@@ -159,7 +169,7 @@ for nodo in NODOS:
             "suelo":  _fmt_suelo(_ultimo),
             "bateria":_fmt_bateria(_ultimo),
             "ultima_actualizacion": datetime.now(),
-            # Campos de imagen — se llenan al recibir foto vía MQTT
+            # Campos de imagen — se llenan al recibir foto vía HTTP
             "ultima_imagen_b64": None,
             "ultima_imagen_ts":  None,
             "imagen_gen": 0,   # contador; sube cada vez que llega foto nueva
@@ -183,7 +193,7 @@ _camara_activa = threading.Event()
 _callbacks_actualizacion = []
 
 def registrar_callback(callback):
-    """Registra un callback que será llamado cuando lleguen datos MQTT."""
+    """Registra un callback que será llamado cuando lleguen datos MQTT o una foto por HTTP."""
     if callback not in _callbacks_actualizacion:
         _callbacks_actualizacion.append(callback)
 
@@ -202,12 +212,13 @@ def notificar_actualizacion():
 
 # ══════════════════════════════════════════════════════════════════════
 #  MQTT — Suscripción a TODOS los nodos activos
+#  (sensores, status y configuración de horario — NO fotos)
 # ══════════════════════════════════════════════════════════════════════
 def mqtt_iniciar_global(on_update):
     """Inicia MQTT y se suscribe a TODOS los nodos activos simultáneamente."""
     global _mqtt_client
     mqtt_detener()
-    
+
     # Crear diccionario topic -> nodo_id para identificar de dónde vienen los datos
     topic_to_nodo = {}
     for nodo in NODOS:
@@ -221,10 +232,9 @@ def mqtt_iniciar_global(on_update):
             for topic in topic_to_nodo.keys():
                 client.subscribe(topic)
                 print(f"[MQTT] Suscrito a {topic}")
-            # También suscribirse a los topics de cámara
-            client.subscribe("cam/start")
-            client.subscribe("cam/data")
-            client.subscribe("cam/end")
+            # NOTA: ya NO nos suscribimos a cam/start, cam/data, cam/end.
+            # Las fotos ahora llegan por HTTP (ver http_photo_server_iniciar()),
+            # no por MQTT+Base64.
         on_update()
         notificar_actualizacion()
 
@@ -234,16 +244,16 @@ def mqtt_iniciar_global(on_update):
         notificar_actualizacion()
 
     def _on_message(client, userdata, msg):
-        """Procesa mensajes de datos de cualquier nodo."""
+        """Procesa mensajes de datos de cualquier nodo (sensores/status)."""
         try:
             # Identificar de qué nodo viene el mensaje
             nodo_id = topic_to_nodo.get(msg.topic)
             if not nodo_id:
                 return  # Topic desconocido
-            
+
             data = json.loads(msg.payload.decode("utf-8"))
             registro = {}
-            
+
             # Actualizar estado del nodo correspondiente
             if "dht" in data:
                 d = data["dht"]
@@ -252,7 +262,7 @@ def mqtt_iniciar_global(on_update):
                 estado_nodos[nodo_id]["dht"]["t"] = f"{t:.1f}" if isinstance(t,(int,float)) else "--"
                 estado_nodos[nodo_id]["dht"]["h"] = f"{h:.1f}" if isinstance(h,(int,float)) else "--"
                 registro["dht"] = {"t": t, "h": h}
-            
+
             if "suelo" in data:
                 s = data["suelo"]
                 estado_nodos[nodo_id]["suelo"] = {
@@ -265,47 +275,29 @@ def mqtt_iniciar_global(on_update):
                     "ph":  f'{_ff(s.get("ph")):.2f}' if _ff(s.get("ph")) is not None else "--",
                 }
                 registro["suelo"] = s
-            
+
             if "bateria" in data:
                 b = data["bateria"]
                 p = b.get("porcentaje")
                 estado_nodos[nodo_id]["bateria"]["porcentaje"] = f"{p:.1f}" if isinstance(p,(int,float)) else "--"
                 registro["bateria"] = b
-            
+
             # Guardar en historial si hay datos
             if registro:
                 guardar_dato(nodo_id, registro)
                 estado_nodos[nodo_id]["ultima_actualizacion"] = datetime.now()
-            
+
             # Notificar a todos los callbacks registrados
             notificar_actualizacion()
             on_update()
         except Exception as e:
             print(f"[MQTT] Error procesando mensaje: {e}")
 
-    def _on_cam_message(client, userdata, msg):
-        t = msg.topic
-        try:
-            if t == "cam/start":
-                cam_on_start(int(msg.payload.decode()))
-            elif t == "cam/data":
-                cam_on_chunk(msg.payload.decode())
-            elif t == "cam/end":
-                cam_on_end()
-        except Exception as e:
-            print(f"[CAM MQTT] {e}")
-    
-    def _on_message_router(client, userdata, msg):
-        if msg.topic.startswith("cam/"):
-            _on_cam_message(client, userdata, msg)
-        else:
-            _on_message(client, userdata, msg)
-
     try:
         _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         _mqtt_client.on_connect    = _on_connect
         _mqtt_client.on_disconnect = _on_disconnect
-        _mqtt_client.on_message    = _on_message_router
+        _mqtt_client.on_message    = _on_message
         _mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
         _mqtt_client.loop_start()
     except Exception as e:
@@ -322,7 +314,7 @@ def mqtt_detener():
     estado_mqtt["conectado"] = False
 
 def mqtt_publicar_config(payload: str) -> bool:
-    """Publica configuración al topic esp32/config."""
+    """Publica configuración al topic esp32/config. (Sin cambios: sigue siendo MQTT)."""
     global _mqtt_client
     try:
         if _mqtt_client and _mqtt_client.is_connected():
@@ -345,10 +337,14 @@ def mqtt_publicar_config(payload: str) -> bool:
 #  dashboard del nodo. La UI se actualiza si los controles están activos;
 #  de lo contrario, los datos quedan en estado_nodos y se muestran la
 #  próxima vez que el usuario abra ese dashboard.
+#
+#  CAMBIO: el transporte ya no es MQTT+Base64 fragmentado, sino un POST
+#  HTTP binario que llega al servidor definido más abajo. La función
+#  _procesar_imagen_recibida() concentra la lógica común de guardado y
+#  actualización de UI, sin importar de dónde vino la imagen.
 # ══════════════════════════════════════════════════════════════════════
 _cam_buffer = {
-    "chunks":   [],
-    "nodo_id":  None,   # qué nodo está enviando fotos
+    "nodo_id":  None,   # qué nodo está enviando fotos (dashboard activo)
     "img_ctrl": None,   # ft.Image activo (solo si el dashboard está abierto)
     "txt_ctrl": None,
     "page":     None,
@@ -357,44 +353,42 @@ _cam_buffer = {
 _CAM_PLACEHOLDER = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="
 
 def camara_iniciar_mqtt(img_ctrl, txt_ctrl, page, nodo_id):
-    """Registra los controles de UI del dashboard activo para actualizaciones en vivo."""
+    """Registra los controles de UI del dashboard activo para actualizaciones en vivo.
+    (El nombre se conserva por compatibilidad; ya no depende de MQTT)."""
     _cam_buffer["nodo_id"]  = nodo_id
     _cam_buffer["img_ctrl"] = img_ctrl
     _cam_buffer["txt_ctrl"] = txt_ctrl
     _cam_buffer["page"]     = page
-    print(f"[CAM] Dashboard activo para {nodo_id} — listo para recibir fotos")
+    print(f"[CAM] Dashboard activo para {nodo_id} — listo para recibir fotos por HTTP")
 
 def camara_detener():
     """Limpia los refs de UI pero conserva nodo_id para seguir guardando fotos."""
     _cam_buffer["img_ctrl"] = None
     _cam_buffer["txt_ctrl"] = None
     _cam_buffer["page"]     = None
-    # nodo_id se conserva para que cam_on_end sepa a qué nodo asignar la imagen
+    # nodo_id se conserva para que _procesar_imagen_recibida sepa a qué nodo
+    # asignar la imagen si llega mientras el dashboard está cerrado.
 
-def cam_on_start(total_len):
-    """Siempre reinicia el buffer al inicio de una nueva foto."""
-    _cam_buffer["chunks"] = []
-    print(f"[CAM] Iniciando recepción {total_len} bytes")
-
-def cam_on_chunk(chunk_b64: str):
-    """Siempre acumula fragmentos, esté o no el dashboard abierto."""
-    _cam_buffer["chunks"].append(chunk_b64)
-
-def cam_on_end():
+def _normalizar_nodo_id(nodo_param: str) -> str:
     """
-    Siempre decodifica, guarda en disco y persiste en estado_nodos.
-    Actualiza la UI si img_ctrl está asignado (dashboard abierto);
-    de lo contrario notifica los callbacks para que cualquier pantalla
-    activa pueda reaccionar.
+    El firmware manda algo como nodo=nodo2_prueba. Aquí lo mapeamos al id
+    real usado en NODOS (nodo1, nodo2, ...), quitando sufijos tipo "_prueba".
     """
-    if not _cam_buffer["chunks"]:
-        return
+    ids_validos = {n["id"] for n in NODOS}
+    if nodo_param in ids_validos:
+        return nodo_param
+    base = nodo_param.split("_")[0]
+    if base in ids_validos:
+        return base
+    return nodo_param  # no reconocido; se guarda igual pero se avisa en consola
+
+def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
+    """
+    Lógica única de persistencia y actualización de UI para una foto recibida.
+    Reemplaza lo que antes hacía cam_on_end() al decodificar Base64 desde MQTT;
+    ahora recibe directamente los bytes binarios del POST HTTP.
+    """
     try:
-        raw_b64   = "".join(_cam_buffer["chunks"]).strip()
-        _cam_buffer["chunks"] = []
-        img_bytes = base64.b64decode(raw_b64)
-
-        nodo_id = _cam_buffer.get("nodo_id") or "unknown"
         nombre  = f"cam_{nodo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         ruta_jpg = os.path.join(DATA_DIR, nombre)
         with open(ruta_jpg, "wb") as f:
@@ -410,12 +404,14 @@ def cam_on_end():
             estado_nodos[nodo_id]["ultima_imagen_b64"] = clean_b64
             estado_nodos[nodo_id]["ultima_imagen_ts"]  = hora
             estado_nodos[nodo_id]["imagen_gen"] = estado_nodos[nodo_id].get("imagen_gen", 0) + 1
+        else:
+            print(f"[CAM] Advertencia: nodo_id '{nodo_id}' no existe en estado_nodos")
 
-        # ── Actualizar UI en vivo si el dashboard está abierto ──
+        # ── Actualizar UI en vivo si el dashboard está abierto en ese nodo ──
         ctrl = _cam_buffer.get("img_ctrl")
         txt  = _cam_buffer.get("txt_ctrl")
         pg   = _cam_buffer.get("page")
-        if ctrl and pg:
+        if ctrl and pg and _cam_buffer.get("nodo_id") == nodo_id:
             ctrl.src = f"data:image/jpeg;base64,{clean_b64}"
             if txt:
                 txt.value  = f"Última foto: {hora}  —  {tam_kb} KB"
@@ -426,13 +422,13 @@ def cam_on_end():
                 pass
             print("[CAM] Imagen mostrada en dashboard activo")
         else:
-            print(f"[CAM] Imagen guardada en estado_nodos[{nodo_id}] (dashboard cerrado)")
+            print(f"[CAM] Imagen guardada en estado_nodos[{nodo_id}] (dashboard cerrado o es otro nodo)")
 
         # Notificar callbacks para que cualquier vista activa reaccione
         notificar_actualizacion()
 
     except Exception as e:
-        print(f"[CAM] Error reconstruyendo imagen: {e}")
+        print(f"[CAM] Error procesando imagen: {e}")
         txt = _cam_buffer.get("txt_ctrl")
         pg  = _cam_buffer.get("page")
         if txt and pg:
@@ -442,6 +438,58 @@ def cam_on_end():
                 pg.update()
             except Exception:
                 pass
+
+# ══════════════════════════════════════════════════════════════════════
+#  SERVIDOR HTTP — Recepción de fotos del ESP32-S3 CAM
+#  Reemplaza el flujo anterior de MQTT + Base64 fragmentado (cam/start,
+#  cam/data, cam/end). El ESP32 ahora hace un POST binario directo aquí.
+# ══════════════════════════════════════════════════════════════════════
+class _PhotoUploadHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # silencia el log default de http.server; usamos nuestros prints
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != HTTP_PHOTO_PATH:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        qs = parse_qs(parsed.query)
+        nodo_param = qs.get("nodo", ["unknown"])[0]
+        nodo_id = _normalizar_nodo_id(nodo_param)
+
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        img_bytes = self.rfile.read(length)
+        print(f"[HTTP] Foto recibida de nodo='{nodo_param}' -> '{nodo_id}' ({length} bytes)")
+
+        if nodo_id not in estado_nodos:
+            print(f"[HTTP] Advertencia: '{nodo_id}' no está en NODOS, la foto no se asocia a ningún dashboard")
+
+        _procesar_imagen_recibida(nodo_id, img_bytes)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def http_photo_server_iniciar():
+    """Levanta el servidor HTTP de fotos en un hilo daemon aparte."""
+    def _run():
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", HTTP_PHOTO_PORT), _PhotoUploadHandler)
+            print(f"[HTTP] Servidor de fotos escuchando en 0.0.0.0:{HTTP_PHOTO_PORT}{HTTP_PHOTO_PATH}")
+            server.serve_forever()
+        except Exception as e:
+            print(f"[HTTP] No se pudo iniciar el servidor de fotos: {e}")
+
+    hilo = threading.Thread(target=_run, daemon=True)
+    hilo.start()
 
 # ══════════════════════════════════════════════════════════════════════
 #  COMPONENTES REUTILIZABLES
@@ -527,7 +575,7 @@ def build_inicio(on_inicio):
                             padding=ft.Padding.symmetric(horizontal=32,vertical=12),elevation=10),
                         on_click=on_inicio, width=220),
                     ft.Container(height=20),
-                    ft.Text("v3.0 · Quindío, Colombia",size=11,
+                    ft.Text("v3.1 · Quindío, Colombia",size=11,
                             color=ft.Colors.with_opacity(0.35,ft.Colors.WHITE)),
                 ], alignment=ft.MainAxisAlignment.CENTER,
                    horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)),
@@ -547,7 +595,7 @@ def build_nodos(on_volver, on_sel):
         cfg = cargar_config_nodo(nodo["id"])
         horas_list = cfg.get("horas", [10, 18])
         num_medidas = len(horas_list)
-        
+
         return ft.Container(border_radius=16,bgcolor=C["blanco"],border=ft.Border.all(1.5,cb),
             padding=ft.Padding.all(16),ink=activo,
             on_click=(lambda e,n=nodo: on_sel(n)) if activo else None,
@@ -571,7 +619,6 @@ def build_nodos(on_volver, on_sel):
                 ft.Row([ft.Icon(ft.Icons.SCHEDULE,color=C["verde"],size=12),
                         ft.Text(f'{num_medidas} medidas/día',size=10,color=C["verde"])], spacing=4),
                 ft.Container(height=8),
-                # CAMBIO: Etiquetas actualizadas
                 ft.Row([chip("S.Ambiente",C["naranja"]),chip("S.Suelo",C["verde_medio"]),
                         chip("Cam",C["cafe"]) if tiene_cam else ft.Container()], spacing=6,wrap=True),
             ], spacing=0))
@@ -609,7 +656,7 @@ def build_nodos(on_volver, on_sel):
 def build_dashboard(nodo, page, on_volver, on_config, on_historico):
     nodo_id = nodo["id"]
     tiene_cam = nodo.get("camera_ip") is not None
-    
+
     # Controles de valor - TAMAÑOS REDUCIDOS
     vt=ft.Text("--",size=16,weight=ft.FontWeight.BOLD,color=C["naranja"])
     vh=ft.Text("--",size=16,weight=ft.FontWeight.BOLD,color=C["azul"])
@@ -623,22 +670,21 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
     vBAT=ft.Text("--",size=14,weight=ft.FontWeight.BOLD,color=C["verde"])
     dot=ft.Container(width=7,height=7,border_radius=4,bgcolor=C["rojo"])
     txt_m=ft.Text("Conectando...",size=9,color=C["gris_texto"])
-    img_c=ft.Image(src=_CAM_PLACEHOLDER,fit="contain",border_radius=8,width=500,rotate=ft.Rotate(1.5707963267948966))
-    txt_c=ft.Text("Esperando foto del nodo via MQTT...",size=9,color=C["gris_texto"],italic=True)
+    img_c=ft.Image(src=_CAM_PLACEHOLDER,fit="contain",border_radius=8,width=500)
+    txt_c=ft.Text("Esperando foto del nodo via HTTP...",size=9,color=C["gris_texto"],italic=True)
 
     # ── Contador de generación de imagen ya mostrada ──────────────────
     # Permite detectar si llegó una foto nueva sin comparar strings base64.
     img_gen_mostrada = {"v": -1}
 
     # ── Inicializar controles desde estado_nodos (pre-cargado del disco) ──
-    # estado_nodos ya contiene el último dato conocido; no hace falta
-    # leer el historial otra vez aquí.
     def actualizar():
         """
         Actualiza la interfaz con datos del estado global del nodo.
         Se llama:
           - inmediatamente al abrir el dashboard (muestra el último dato guardado)
-          - cada vez que llega un mensaje MQTT nuevo (datos o foto)
+          - cada vez que llega un mensaje MQTT nuevo (sensores)
+          - cada vez que llega una foto nueva por HTTP
         """
         d=estado_nodos[nodo_id]["dht"]; vt.value=d["t"]; vh.value=d["h"]
         s=estado_nodos[nodo_id]["suelo"]
@@ -667,9 +713,9 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
         except Exception as e:
             print(f"[ACTUALIZAR] Error: {e}")
 
-    # Registrar callback para recibir actualizaciones MQTT
+    # Registrar callback para recibir actualizaciones (MQTT y fotos HTTP)
     registrar_callback(actualizar)
-    
+
     # Actualizar inmediatamente para mostrar el estado actual (datos + foto guardada)
     actualizar()
 
@@ -678,16 +724,16 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
         desregistrar_callback(actualizar)
         on_volver()
 
-    # Iniciar cámara: registra img_ctrl para actualizaciones en vivo
+    # Registrar controles de cámara para actualizaciones en vivo vía HTTP
     if tiene_cam:
         camara_iniciar_mqtt(img_c, txt_c, page, nodo_id)
 
     # NAVEGACIÓN POR VENTANAS (sin scroll)
     vista_actual = {"v": 0}  # 0: DHT+Bat, 1: Suelo, 2: Cámara
-    
+
     # Contenedor de las vistas
     contenedor_vistas = ft.Container(expand=True)
-    
+
     # Vista 1: DHT22 + Batería
     vista_dht_bat = ft.Container(border_radius=12,bgcolor=C["fondo"],
         padding=ft.Padding.all(8),
@@ -744,7 +790,7 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
         border=ft.Border.all(1,C["cafe_borde"]),padding=ft.Padding.all(8),
         content=ft.Column([
             sec_header(ft.Icons.CAMERA_ALT,"Cámara ESP32-CAM",
-                f'Stream MJPEG — {nodo["camera_ip"] if tiene_cam else "No disponible"}',C["cafe"]),
+                f'Fotos vía HTTP — {nodo["camera_ip"] if tiene_cam else "No disponible"}',C["cafe"]),
             ft.Divider(color=C["cafe_borde"],height=1),ft.Container(height=2),
             ft.Row([txt_c],alignment=ft.MainAxisAlignment.CENTER),
             ft.Container(alignment=ft.Alignment(0,0),border_radius=8,
@@ -757,7 +803,7 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
     vistas = [vista_dht_bat, vista_suelo]
     if tiene_cam:
         vistas.append(vista_camara)
-    
+
     nombres_vistas = ["DHT22 + Batería", "Sensor de Suelo"]
     if tiene_cam:
         nombres_vistas.append("Cámara")
@@ -775,20 +821,20 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
         icon_color=C["verde"],
         icon_size=16,
         on_click=lambda e: cambiar_vista(max(0, vista_actual["v"] - 1)))
-    
+
     btn_siguiente = ft.IconButton(
         icon=ft.Icons.ARROW_FORWARD_IOS,
         icon_color=C["verde"],
         icon_size=16,
         on_click=lambda e: cambiar_vista(min(len(vistas) - 1, vista_actual["v"] + 1)))
-    
+
     txt_vista_actual = ft.Text("", size=10, weight=ft.FontWeight.BOLD, color=C["negro_texto"])
-    
+
     def actualizar_botones_nav():
         btn_anterior.disabled = (vista_actual["v"] == 0)
         btn_siguiente.disabled = (vista_actual["v"] == len(vistas) - 1)
         txt_vista_actual.value = nombres_vistas[vista_actual["v"]]
-    
+
     actualizar_botones_nav()
     contenedor_vistas.content = vistas[0]
 
@@ -837,7 +883,7 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                     btn_historial,
                 ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
                 ft.Divider(color=C["gris_borde"],height=1),
-                
+
                 # Navegación de vistas
                 ft.Row([
                     btn_anterior,
@@ -845,7 +891,7 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                         alignment=ft.MainAxisAlignment.CENTER)),
                     btn_siguiente,
                 ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                
+
                 ft.Container(height=2),
                 # Contenedor de vista actual
                 contenedor_vistas,
@@ -1062,7 +1108,7 @@ def build_historico(nodo, page, on_volver):
     nodo_id = nodo["id"]
     historial = list(reversed(cargar_historial(nodo_id)))
     total = len(historial)
-    
+
     # Paginación
     pagina_actual = {"v": 0}
     registros_por_pagina = 5
@@ -1121,7 +1167,7 @@ def build_historico(nodo, page, on_volver):
     # Contenedor de filas
     filas_col = ft.Column(spacing=3)
     txt_pagina = ft.Text("", size=12, color=C["gris_texto"])
-    
+
     btn_primera = ft.IconButton(icon=ft.Icons.FIRST_PAGE, icon_color=C["verde"])
     btn_anterior = ft.IconButton(icon=ft.Icons.CHEVRON_LEFT, icon_color=C["verde"])
     btn_siguiente = ft.IconButton(icon=ft.Icons.CHEVRON_RIGHT, icon_color=C["verde"])
@@ -1131,32 +1177,32 @@ def build_historico(nodo, page, on_volver):
         inicio = pagina_actual["v"] * registros_por_pagina
         fin = min(inicio + registros_por_pagina, total)
         registros_pagina = historial[inicio:fin]
-        
+
         filas_col.controls = [fila_dato(r, i) for i, r in enumerate(registros_pagina)]
         txt_pagina.value = f"Página {pagina_actual['v'] + 1} de {total_paginas}  ({inicio + 1}-{fin} de {total})"
-        
+
         # Actualizar botones
         btn_primera.disabled = (pagina_actual["v"] == 0)
         btn_anterior.disabled = (pagina_actual["v"] == 0)
         btn_siguiente.disabled = (pagina_actual["v"] >= total_paginas - 1)
         btn_ultima.disabled = (pagina_actual["v"] >= total_paginas - 1)
-        
+
         page.update()
 
     def ir_primera(e):
         pagina_actual["v"] = 0
         actualizar_tabla()
-    
+
     def ir_anterior(e):
         if pagina_actual["v"] > 0:
             pagina_actual["v"] -= 1
             actualizar_tabla()
-    
+
     def ir_siguiente(e):
         if pagina_actual["v"] < total_paginas - 1:
             pagina_actual["v"] += 1
             actualizar_tabla()
-    
+
     def ir_ultima(e):
         pagina_actual["v"] = total_paginas - 1
         actualizar_tabla()
@@ -1280,7 +1326,7 @@ def build_historico(nodo, page, on_volver):
 #  APLICACIÓN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════
 def main(page: ft.Page):
-    page.title = "AgroTech Dashboard v3.0"
+    page.title = "AgroTech Dashboard v3.1"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
     try:
@@ -1291,13 +1337,16 @@ def main(page: ft.Page):
         pass
 
     cont = ft.Container(expand=True)
-    
-    # Iniciar MQTT global desde el principio
+
+    # Iniciar MQTT global desde el principio (sensores/status/config)
     def global_update():
         """Callback para actualizaciones globales de MQTT."""
         page.update()
-    
+
     mqtt_iniciar_global(global_update)
+
+    # NUEVO: iniciar servidor HTTP de fotos (reemplaza MQTT+Base64 para cámara)
+    http_photo_server_iniciar()
 
     def mostrar_inicio():
         cont.content = build_inicio(on_inicio=lambda e: mostrar_nodos())
