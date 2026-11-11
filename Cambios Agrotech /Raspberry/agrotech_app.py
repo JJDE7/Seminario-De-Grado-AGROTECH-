@@ -37,8 +37,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 NODOS = [
     {"id":"nodo1","nombre":"Nodo 1 · Parcela A","topic":"esp32/nodo1/data","camera_ip":"192.168.137.20","activo":True},
-    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":None,"activo":False}, #Aqui se desactivo manualmente el nodo
-    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":None,"activo":False}, #Aqui se desactivo manualmente el nodo
+    {"id":"nodo2","nombre":"Nodo 2 · Parcela B","topic":"esp32/nodo2/data","camera_ip":"192.168.137.21","activo":True}, #Aqui se desactivo manualmente el nodo
+    {"id":"nodo3","nombre":"Nodo 3 · Parcela C","topic":"esp32/nodo3/data","camera_ip":"192.168.137.22","activo":True}, #Aqui se desactivo manualmente el nodo
     {"id":"nodo4","nombre":"Nodo 4 · Reserva","topic":"esp32/nodo4/data","camera_ip":None,"activo":False},   #Aqui se desactivo manualmente el nodo
 ]
 
@@ -954,11 +954,9 @@ def build_config(nodo, page, on_volver):
         ],
     }
 
-    if len(horarios_guardados) == 3:
-        modo["v"] = "3"
-    elif len(horarios_guardados) > 3:
-        modo["v"] = "N"
-        num_custom["v"] = len(horarios_guardados)
+    # La pantalla siempre abre en "2 Medidas".
+    # Las configuraciones guardadas se conservan para reutilizarlas si el
+    # usuario cambia a otro modo, pero no fuerzan la selección inicial.
 
     estado_txt = ft.Text(
         f'Horario activo: {len(horarios_guardados)} medidas/dia  -  '
@@ -969,14 +967,14 @@ def build_config(nodo, page, on_volver):
     btn_3med = ft.Container(border_radius=8, padding=ft.Padding.all(8))
     btn_nmed = ft.Container(border_radius=8, padding=ft.Padding.all(8))
 
-    dropdowns_container = ft.Row(wrap=True, spacing=8, run_spacing=8)
-    # Con muchas medidas, la lista puede crecer verticalmente.
-    horarios_scroll = ft.Column(
-        [dropdowns_container],
-        scroll=ft.ScrollMode.AUTO,
+    # Lista vertical en lugar de Row(wrap=True): evita recalcular
+    # continuamente el ajuste de cientos de tarjetas.
+    dropdowns_container = ft.ListView(
         expand=True,
-        spacing=0,
+        spacing=6,
+        auto_scroll=False,
     )
+    horarios_scroll = dropdowns_container
 
     num_display = ft.Text(
         str(num_custom["v"]), size=15,
@@ -988,44 +986,50 @@ def build_config(nodo, page, on_volver):
     btn_enviar = None
     estado_error = None
 
+    def horario_de_ref(ref):
+        h = ref["hora"].value
+        m = ref["minuto"].value
+        if h is None or m is None:
+            return None
+        return f"{int(h):02d}:{int(m):02d}"
+
     def validar_horarios():
         """
-        Valida duplicados en tiempo real.
-        Si una medida posterior intenta usar exactamente el mismo HH:MM,
-        se marca en rojo y el botón Aplicar queda bloqueado.
+        Una sola pasada O(n) para detectar duplicados.
+        No reconstruye la UI; solo cambia los controles cuyo estado
+        realmente cambió. Esto reduce trabajo cuando hay muchas medidas.
         """
         usados = {}
         hay_error = False
 
         for i, ref in enumerate(refs_activos):
-            h = ref["hora"].value
-            m = ref["minuto"].value
-            horario = None
-
-            if h is not None and m is not None:
-                horario = f"{int(h):02d}:{int(m):02d}"
-
+            horario = horario_de_ref(ref)
             duplicado = horario is not None and horario in usados
 
-            ref["container"].border = ft.Border.all(
-                1.5 if duplicado else 1,
-                C["rojo"] if duplicado else C["gris_borde"])
-
-            ref["error"].value = (
-                f"Horario repetido: {horario}" if duplicado else "")
-            ref["error"].visible = duplicado
+            estado_anterior = ref.get("duplicado", False)
+            if duplicado != estado_anterior:
+                ref["container"].border = ft.Border.all(
+                    1.5 if duplicado else 1,
+                    C["rojo"] if duplicado else C["gris_borde"])
+                ref["error"].value = (
+                    f"Horario repetido: {horario}" if duplicado else "")
+                ref["error"].visible = duplicado
+                ref["duplicado"] = duplicado
 
             if duplicado:
                 hay_error = True
             elif horario is not None:
                 usados[horario] = i
 
-        if btn_enviar is not None:
-            btn_enviar.disabled = hay_error or len(refs_activos) == 0
+        nuevo_disabled = hay_error or len(refs_activos) == 0
+        if btn_enviar is not None and btn_enviar.disabled != nuevo_disabled:
+            btn_enviar.disabled = nuevo_disabled
 
         return not hay_error
 
     def on_horario_change(e):
+        # La protección sigue siendo inmediata, pero evitamos trabajo
+        # adicional fuera de esta única validación.
         validar_horarios()
         page.update()
 
@@ -1039,28 +1043,18 @@ def build_config(nodo, page, on_volver):
         return "23:59"
 
     def decrementar(e):
-        if num_custom["v"] > 4:
-            num_custom["v"] -= 1
-            num_display.value = str(num_custom["v"])
-            actualizar_dropdowns_custom()
-            page.update()
+        quitar_medida_custom()
 
     def incrementar(e):
-        # Sin límite arbitrario de 12; 1440 es el máximo matemático de
-        # horarios únicos posibles en un día con resolución de un minuto.
         if num_custom["v"] >= 24 * 60:
             if estado_error is not None:
                 estado_error.value = (
                     "No se pueden agregar más medidas: los 1440 minutos "
                     "del día ya están ocupados.")
                 estado_error.visible = True
-            page.update()
+                page.update()
             return
-
-        num_custom["v"] += 1
-        num_display.value = str(num_custom["v"])
-        actualizar_dropdowns_custom()
-        page.update()
+        agregar_medida_custom()
 
     selector_cantidad = ft.Row([
         ft.IconButton(
@@ -1094,7 +1088,7 @@ def build_config(nodo, page, on_volver):
         hora_val, minuto_val = map(int, horario_val.split(":"))
 
         dd_hora = ft.Dropdown(
-            width=68,
+            width=84,
             value=str(hora_val),
             options=[ft.dropdown.Option(str(h)) for h in range(24)],
             label=f"H{idx_label}",
@@ -1103,7 +1097,7 @@ def build_config(nodo, page, on_volver):
             content_padding=ft.Padding.symmetric(horizontal=5, vertical=2))
 
         dd_minuto = ft.Dropdown(
-            width=68,
+            width=84,
             value=str(minuto_val),
             options=[ft.dropdown.Option(f"{m:02d}") for m in range(60)],
             label="Min",
@@ -1121,7 +1115,7 @@ def build_config(nodo, page, on_volver):
             visible=False, text_align=ft.TextAlign.CENTER)
 
         item = ft.Container(
-            width=150,
+            width=184,
             padding=ft.Padding.symmetric(horizontal=5, vertical=4),
             border_radius=8,
             border=ft.Border.all(1, C["gris_borde"]),
@@ -1145,10 +1139,12 @@ def build_config(nodo, page, on_volver):
             "minuto": dd_minuto,
             "container": item,
             "error": error,
+            "duplicado": False,
         })
         return item
 
-    def actualizar_dropdowns_custom():
+    def reconstruir_horarios_custom():
+        """Reconstruye solo al cambiar de modo; +/- modifica incrementalmente."""
         refs_activos.clear()
         n = num_custom["v"]
         horarios = horarios_seleccionados["N"]
@@ -1160,6 +1156,42 @@ def build_config(nodo, page, on_volver):
             hacer_dropdown(horarios[i], i + 1) for i in range(n)
         ]
         validar_horarios()
+
+    def agregar_medida_custom():
+        """Añade una sola tarjeta, sin reconstruir las anteriores."""
+        n_actual = len(refs_activos)
+        if n_actual >= 24 * 60:
+            return
+
+        horarios = horarios_seleccionados["N"]
+        nuevo = siguiente_horario_libre(horarios)
+        horarios.append(nuevo)
+        num_custom["v"] = n_actual + 1
+        num_display.value = str(num_custom["v"])
+
+        dropdowns_container.controls.append(
+            hacer_dropdown(nuevo, num_custom["v"])
+        )
+        validar_horarios()
+        page.update()
+
+    def quitar_medida_custom():
+        """Elimina solo la última tarjeta."""
+        if len(refs_activos) <= 4:
+            return
+
+        refs_activos.pop()
+        if dropdowns_container.controls:
+            dropdowns_container.controls.pop()
+
+        horarios = horarios_seleccionados["N"]
+        if horarios:
+            horarios.pop()
+
+        num_custom["v"] = len(refs_activos)
+        num_display.value = str(num_custom["v"])
+        validar_horarios()
+        page.update()
 
     def actualizar_modo_ui():
         refs_activos.clear()
@@ -1182,7 +1214,7 @@ def build_config(nodo, page, on_volver):
         selector_cantidad.visible = (modo["v"] == "N")
 
         if modo["v"] == "N":
-            actualizar_dropdowns_custom()
+            reconstruir_horarios_custom()
         else:
             n = int(modo["v"])
             horarios = horarios_seleccionados[modo["v"]]
