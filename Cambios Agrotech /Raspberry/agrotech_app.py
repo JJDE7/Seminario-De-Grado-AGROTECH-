@@ -1,11 +1,13 @@
 """
-AgroTech Dashboard — Compatible con Flet 0.84+
+AgroTech Dashboard + FastAPI — Compatible con Flet 0.84+
 v3.2 — Cambios principales:
 - Suscripción simultánea a todos los nodos desde el inicio
 - Navegación por ventanas sin scroll táctil
 - Horarios personalizables (hora y minuto)
 - Historial paginado (10 registros por página)
 - NUEVO: Recepción de fotografías por HTTP (reemplaza MQTT+Base64).
+- NUEVO: FastAPI + página HTML para consultas y configuración mediante REST.
+- WebSocket eliminado: el navegador realiza solicitudes bajo demanda.
   MQTT se conserva para sensores, status y configuración de horario.
 
 v12 - CORRECCIONES (firmware nodo2_esp32s3_v12.ino):
@@ -25,7 +27,6 @@ import flet as ft
 import paho.mqtt.client as mqtt
 import json
 import sqlite3
-import asyncio
 import threading
 import time          # v12: espera de la confirmacion del nodo
 import base64
@@ -36,10 +37,11 @@ from typing import Optional
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-try:
-    import websockets
-except ImportError:
-    websockets = None
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, Response
+from pydantic import BaseModel
+import uvicorn
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
@@ -63,9 +65,9 @@ HTTP_PHOTO_PATH = "/upload"
 # JSON se conserva como respaldo y para que la interfaz Flet siga funcionando.
 SQLITE_DB = os.path.join(os.path.expanduser("~/agrotech/data"), "agrotech.db")
 
-# NUEVO: servidor WebSocket para clientes externos (HTML, otras apps, etc.).
-WEBSOCKET_HOST = "0.0.0.0"
-WEBSOCKET_PORT = 8765
+# NUEVO: servidor FastAPI para la aplicación web y API REST.
+FASTAPI_HOST = "0.0.0.0"
+FASTAPI_PORT = 8000
 
 DATA_DIR    = os.path.expanduser("~/agrotech/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -119,6 +121,21 @@ def sqlite_iniciar():
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_mediciones_nodo_fecha
                 ON mediciones(nodo_id, timestamp)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS fotos (
+                    nodo_id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    imagen BLOB NOT NULL,
+                    tam_bytes INTEGER NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS configuraciones (
+                    nodo_id TEXT PRIMARY KEY,
+                    horarios TEXT NOT NULL,
+                    actualizado TEXT NOT NULL
+                )
             """)
             conn.commit()
         print(f"[SQLITE] Base de datos lista: {SQLITE_DB}")
@@ -227,171 +244,6 @@ def sqlite_historial(nodo_id, limite=100):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  WEBSOCKET — SERVIDOR PARA CLIENTES EXTERNOS
-# ══════════════════════════════════════════════════════════════════════
-_ws_loop = None
-_ws_thread = None
-_ws_clients = set()
-_ws_ready = threading.Event()
-
-
-def _websocket_payload_lectura(nodo_id, dato, timestamp):
-    return {
-        "tipo": "lectura",
-        "nodo_id": nodo_id,
-        "timestamp": timestamp,
-        **dato,
-    }
-
-
-def _websocket_payload_foto(nodo_id, img_bytes, timestamp, tam_kb):
-    return {
-        "tipo": "foto",
-        "nodo_id": nodo_id,
-        "timestamp": timestamp,
-        "tam_kb": tam_kb,
-        "imagen_b64": base64.b64encode(img_bytes).decode("utf-8"),
-    }
-
-
-async def _ws_handler(websocket, *args):
-    """Atiende clientes externos y consultas de último dato/historial."""
-    _ws_clients.add(websocket)
-    try:
-        await websocket.send(json.dumps({
-            "tipo": "conexion",
-            "estado": "conectado",
-            "servidor": "AgroTech",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }, ensure_ascii=False))
-
-        # Entrega el último estado disponible de los nodos al conectar.
-        for nodo in NODOS:
-            if nodo["activo"]:
-                ultimo = sqlite_ultimo(nodo["id"])
-                if ultimo:
-                    await websocket.send(json.dumps(ultimo, ensure_ascii=False))
-
-        async for mensaje in websocket:
-            try:
-                solicitud = json.loads(mensaje)
-            except Exception:
-                await websocket.send(json.dumps({
-                    "tipo": "error",
-                    "mensaje": "La solicitud no es JSON válido."
-                }, ensure_ascii=False))
-                continue
-
-            if solicitud.get("tipo") != "consulta":
-                await websocket.send(json.dumps({
-                    "tipo": "error",
-                    "mensaje": "Tipo de solicitud no soportado."
-                }, ensure_ascii=False))
-                continue
-
-            accion = solicitud.get("accion")
-            nodo_id = solicitud.get("nodo") or solicitud.get("nodo_id")
-
-            if not nodo_id:
-                await websocket.send(json.dumps({
-                    "tipo": "error",
-                    "mensaje": "Falta el nodo."
-                }, ensure_ascii=False))
-                continue
-
-            if accion == "ultimo":
-                dato = sqlite_ultimo(nodo_id)
-                respuesta = dato or {
-                    "tipo": "respuesta",
-                    "accion": "ultimo",
-                    "nodo_id": nodo_id,
-                    "datos": None,
-                }
-                await websocket.send(json.dumps(respuesta, ensure_ascii=False))
-
-            elif accion == "historial":
-                historial = sqlite_historial(
-                    nodo_id,
-                    solicitud.get("limite", 100)
-                )
-                await websocket.send(json.dumps({
-                    "tipo": "historial",
-                    "nodo_id": nodo_id,
-                    "cantidad": len(historial),
-                    "datos": historial,
-                }, ensure_ascii=False))
-
-            else:
-                await websocket.send(json.dumps({
-                    "tipo": "error",
-                    "mensaje": f"Acción no soportada: {accion}"
-                }, ensure_ascii=False))
-    except Exception as e:
-        print(f"[WS] Cliente desconectado: {e}")
-    finally:
-        _ws_clients.discard(websocket)
-
-
-async def _ws_broadcast(payload):
-    if not _ws_clients:
-        return
-
-    mensaje = json.dumps(payload, ensure_ascii=False)
-    clientes = list(_ws_clients)
-    resultados = await asyncio.gather(
-        *(cliente.send(mensaje) for cliente in clientes),
-        return_exceptions=True
-    )
-
-    for cliente, resultado in zip(clientes, resultados):
-        if isinstance(resultado, Exception):
-            _ws_clients.discard(cliente)
-
-
-async def _ws_main():
-    async with websockets.serve(_ws_handler, WEBSOCKET_HOST, WEBSOCKET_PORT):
-        print(f"[WS] Servidor WebSocket escuchando en ws://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}")
-        _ws_ready.set()
-        await asyncio.Future()
-
-
-def websocket_broadcast(payload):
-    """Envía un mensaje desde MQTT/HTTP hacia el hilo asyncio del WebSocket."""
-    if _ws_loop and _ws_loop.is_running():
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _ws_broadcast(payload),
-                _ws_loop
-            )
-        except Exception as e:
-            print(f"[WS] Error programando broadcast: {e}")
-
-
-def websocket_iniciar():
-    """Levanta el servidor WebSocket en un hilo separado para no bloquear Flet/MQTT."""
-    global _ws_loop, _ws_thread
-
-    if websockets is None:
-        print("[WS] ERROR: falta instalar la librería 'websockets'.")
-        print("[WS] Instala con: pip install websockets")
-        return False
-
-    def _run():
-        global _ws_loop
-        try:
-            _ws_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(_ws_loop)
-            _ws_loop.run_until_complete(_ws_main())
-        except Exception as e:
-            print(f"[WS] No se pudo iniciar: {e}")
-
-    _ws_thread = threading.Thread(target=_run, daemon=True)
-    _ws_thread.start()
-    _ws_ready.wait(timeout=3)
-    return _ws_ready.is_set()
-
-
-# ══════════════════════════════════════════════════════════════════════
 #  PERSISTENCIA DE DATOS
 # ══════════════════════════════════════════════════════════════════════
 def ruta_historial(nodo_id):
@@ -469,6 +321,44 @@ def _minutos_desde_medianoche(horario):
     """Convierte HH:MM a minutos desde medianoche para ordenar."""
     h, m = map(int, horario.split(":"))
     return h * 60 + m
+
+
+def guardar_config_sqlite(nodo_id, horarios_list):
+    """Guarda la configuración de horarios en SQLite para la API REST."""
+    horarios = _normalizar_horarios(horarios_list)
+    horarios = sorted(set(horarios), key=_minutos_desde_medianoche)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            conn.execute("""
+                INSERT INTO configuraciones (nodo_id, horarios, actualizado)
+                VALUES (?, ?, ?)
+                ON CONFLICT(nodo_id) DO UPDATE SET
+                    horarios=excluded.horarios,
+                    actualizado=excluded.actualizado
+            """, (nodo_id, json.dumps(horarios), timestamp))
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[SQLITE] Error guardando configuración de {nodo_id}: {e}")
+        return False
+
+
+def sqlite_config(nodo_id):
+    """Obtiene la configuración de horarios desde SQLite; usa JSON como respaldo."""
+    try:
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            row = conn.execute("""
+                SELECT horarios, actualizado
+                FROM configuraciones
+                WHERE nodo_id = ?
+            """, (nodo_id,)).fetchone()
+        if row:
+            horarios = _normalizar_horarios(json.loads(row[0]))
+            return {"horas": sorted(set(horarios), key=_minutos_desde_medianoche), "actualizado": row[1]}
+    except Exception as e:
+        print(f"[SQLITE] Error consultando configuración de {nodo_id}: {e}")
+    return cargar_config_nodo(nodo_id)
 
 
 def guardar_config_nodo(nodo_id, horarios_list):
@@ -706,13 +596,6 @@ def mqtt_iniciar_global(on_update):
 
                 estado_nodos[nodo_id]["ultima_actualizacion"] = datetime.now()
 
-                # Comunicación externa por WebSocket
-                websocket_broadcast(
-                    _websocket_payload_lectura(
-                        nodo_id, registro, timestamp_medicion
-                    )
-                )
-
             # Notificar a todos los callbacks registrados
             notificar_actualizacion()
             on_update()
@@ -891,6 +774,22 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
         clean_b64 = base64.b64encode(img_bytes).decode("utf-8")
         hora      = datetime.now().strftime("%H:%M:%S")
         tam_kb    = len(img_bytes) // 1024
+        timestamp_foto = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # ── Persistir la última foto en SQLite (fuente de la API REST) ──
+        try:
+            with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+                conn.execute("""
+                    INSERT INTO fotos (nodo_id, timestamp, imagen, tam_bytes)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(nodo_id) DO UPDATE SET
+                        timestamp=excluded.timestamp,
+                        imagen=excluded.imagen,
+                        tam_bytes=excluded.tam_bytes
+                """, (nodo_id, timestamp_foto, sqlite3.Binary(img_bytes), len(img_bytes)))
+                conn.commit()
+        except Exception as e:
+            print(f"[SQLITE] Error guardando foto de {nodo_id}: {e}")
 
         # ── Persistir en estado_nodos (siempre, independiente de la UI) ──
         if nodo_id in estado_nodos:
@@ -916,16 +815,6 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
             print("[CAM] Imagen mostrada en dashboard activo")
         else:
             print(f"[CAM] Imagen guardada en estado_nodos[{nodo_id}] (dashboard cerrado o es otro nodo)")
-
-        # Comunicación externa: enviar la foto por WebSocket.
-        websocket_broadcast(
-            _websocket_payload_foto(
-                nodo_id,
-                img_bytes,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                tam_kb
-            )
-        )
 
         # Notificar callbacks para que cualquier vista activa reaccione
         notificar_actualizacion()
@@ -993,6 +882,183 @@ def http_photo_server_iniciar():
 
     hilo = threading.Thread(target=_run, daemon=True)
     hilo.start()
+
+# ══════════════════════════════════════════════════════════════════════
+#  FASTAPI — APLICACIÓN WEB + API REST
+#  No usa WebSocket, SSE ni polling automático.
+#  El navegador solicita datos solamente cuando el usuario pulsa una acción.
+# ══════════════════════════════════════════════════════════════════════
+app = FastAPI(title="AgroTech API", version="1.0")
+
+
+class ConfigHorarioAPI(BaseModel):
+    horarios: list[str]
+
+
+HTML_AGROTECH = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgroTech · API REST</title>
+<style>
+:root { --verde:#2E7D32; --verde2:#1B5E20; --fondo:#F1F5F1; --borde:#D7E2D7; --texto:#212121; --gris:#6B7280; --rojo:#C62828; }
+*{box-sizing:border-box} body{margin:0;font-family:Arial,sans-serif;background:var(--fondo);color:var(--texto)}
+header{background:linear-gradient(135deg,var(--verde),var(--verde2));color:white;padding:18px 24px;box-shadow:0 2px 8px #0002}
+header h1{margin:0;font-size:24px} header p{margin:5px 0 0;opacity:.82;font-size:13px}
+main{max-width:1180px;margin:20px auto;padding:0 14px}.toolbar,.card{background:white;border:1px solid var(--borde);border-radius:12px;padding:16px;box-shadow:0 2px 8px #0000000d;margin-bottom:14px}
+.toolbar{display:flex;gap:10px;align-items:end;flex-wrap:wrap}.field{display:flex;flex-direction:column;gap:5px}.field label{font-size:12px;color:var(--gris);font-weight:bold}
+select,input,button{font:inherit;border-radius:8px;border:1px solid #CBD5CB;padding:9px 11px}button{cursor:pointer;background:var(--verde);color:white;border:none;font-weight:bold}button.secondary{background:#607D60}button.danger{background:var(--rojo)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.metric{background:#F7FAF7;border:1px solid var(--borde);border-radius:9px;padding:10px}.metric small{display:block;color:var(--gris);font-size:11px}.metric strong{font-size:18px;color:var(--verde)}
+img{max-width:100%;width:100%;max-height:430px;object-fit:contain;border-radius:9px;background:#eee;min-height:180px}.status{font-size:12px;color:var(--gris);min-height:18px}.ok{color:var(--verde)}.error{color:var(--rojo)}
+.horarios{display:flex;gap:8px;flex-wrap:wrap}.horario{display:flex;gap:5px;align-items:center;background:#F7FAF7;padding:7px;border-radius:8px;border:1px solid var(--borde)}
+.horario button{padding:5px 8px;background:var(--rojo)}.acciones{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:7px;border-bottom:1px solid #E5E7EB;text-align:center}th{background:var(--verde);color:white;position:sticky;top:0}.table-wrap{overflow:auto;max-height:380px}
+@media(max-width:850px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header><h1>🌱 AgroTech</h1><p>Monitoreo agrícola · interfaz web basada en API REST</p></header>
+<main>
+<section class="toolbar">
+  <div class="field"><label>Nodo</label><select id="nodo"></select></div>
+  <button onclick="cargarDatos()">Actualizar datos</button>
+  <button onclick="cargarFoto()">Solicitar fotografía</button>
+  <button class="secondary" onclick="cargarHistorial()">Consultar historial</button>
+</section>
+<div id="estado" class="status"></div>
+<section class="grid">
+  <div class="card"><h3>Última medición</h3><div id="metricas" class="metrics"><div class="metric"><small>Temperatura</small><strong>--</strong></div></div></div>
+  <div class="card"><h3>Última fotografía</h3><img id="foto" alt="Última fotografía del nodo"><div id="fotoInfo" class="status">Pulsa «Solicitar fotografía» para consultar SQLite.</div></div>
+</section>
+<section class="card"><h3>Configuración de horarios</h3><div id="horarios" class="horarios"></div><div class="acciones"><button onclick="agregarHorario()">+ Añadir horario</button><button onclick="guardarHorarios()">Enviar configuración</button></div><div id="configEstado" class="status"></div></section>
+<section class="card"><h3>Historial</h3><div id="historial" class="table-wrap">Pulsa «Consultar historial».</div></section>
+</main>
+<script>
+let horarios=[];
+const $=id=>document.getElementById(id);
+function nodo(){return $('nodo').value}
+function setEstado(msg,ok=false){$('estado').textContent=msg;$('estado').className='status '+(ok?'ok':'')}
+async function api(url,opts={}){const r=await fetch(url,opts);if(!r.ok){let d={};try{d=await r.json()}catch{};throw new Error(d.detail||`HTTP ${r.status}`)}return r}
+async function cargarNodos(){const d=await (await api('/api/nodos')).json();$('nodo').innerHTML=d.nodos.map(n=>`<option value="${n.id}">${n.nombre}</option>`).join('');await cargarConfig();await cargarDatos()}
+function mostrarMetricas(d){const s=d.suelo||{},a=d.dht||{},b=d.bateria||{};$('metricas').innerHTML=[['Temperatura',a.t,'°C'],['Humedad',a.h,'%'],['N',s.N,'mg/kg'],['P',s.P,'mg/kg'],['K',s.K,'mg/kg'],['Hum. suelo',s.hum,'%'],['Temp. suelo',s.temp,'°C'],['EC',s.ec,'µS/cm'],['pH',s.ph,''],['Batería',b.porcentaje,'%']].map(x=>`<div class="metric"><small>${x[0]}</small><strong>${x[1]??'--'} ${x[2]}</strong></div>`).join('')}
+async function cargarDatos(){try{const d=await (await api(`/api/nodos/${nodo()}/ultimo`)).json();mostrarMetricas(d);setEstado(`Última lectura: ${d.timestamp}`,true)}catch(e){setEstado(e.message)}}
+async function cargarFoto(){try{$('foto').src=`/api/nodos/${nodo()}/foto?t=${Date.now()}`;const r=await api(`/api/nodos/${nodo()}/foto/meta`);const d=await r.json();$('fotoInfo').textContent=`Última foto: ${d.timestamp} · ${Math.round(d.tam_bytes/1024)} KB`;setEstado('Fotografía consultada desde SQLite.',true)}catch(e){$('foto').removeAttribute('src');$('fotoInfo').textContent=e.message;setEstado(e.message)}}
+function renderHorarios(){horarios.forEach((h,i)=>{});$('horarios').innerHTML=horarios.map((h,i)=>`<div class="horario"><input type="time" value="${h}" onchange="horarios[${i}]=this.value"><button onclick="horarios.splice(${i},1);renderHorarios()">×</button></div>`).join('')}
+function agregarHorario(){let usados=new Set(horarios),v='00:00';for(let m=0;m<1440;m++){v=String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');if(!usados.has(v))break}horarios.push(v);horarios.sort();renderHorarios()}
+async function cargarConfig(){try{const d=await (await api(`/api/nodos/${nodo()}/config`)).json();horarios=d.horarios||[];renderHorarios();$('configEstado').textContent=`Última actualización: ${d.actualizado||'—'}`}catch(e){$('configEstado').textContent=e.message}}
+async function guardarHorarios(){const unicos=[...new Set(horarios.filter(Boolean))].sort();if(!unicos.length){$('configEstado').textContent='Debe existir al menos un horario.';return}if(unicos.length!==horarios.length){$('configEstado').textContent='No se permiten horarios duplicados.';return}try{const d=await (await api(`/api/nodos/${nodo()}/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({horarios:unicos})})).json();horarios=d.horarios;renderHorarios();$('configEstado').textContent=`Configuración enviada por MQTT: ${horarios.join(', ')}`;setEstado('Configuración guardada en SQLite y publicada por MQTT.',true)}catch(e){$('configEstado').textContent=e.message}}
+async function cargarHistorial(){try{const d=await (await api(`/api/nodos/${nodo()}/historial?limite=100`)).json();if(!d.datos.length){$('historial').textContent='Sin registros.';return}let h='<table><thead><tr><th>Fecha</th><th>T.Amb</th><th>H.Amb</th><th>N</th><th>P</th><th>K</th><th>H.Suelo</th><th>T.Suelo</th><th>EC</th><th>pH</th><th>Bat.</th></tr></thead><tbody>';for(const r of d.datos){const a=r.dht||{},s=r.suelo||{},b=r.bateria||{};h+=`<tr><td>${r.timestamp||'—'}</td><td>${a.t??'—'}</td><td>${a.h??'—'}</td><td>${s.N??'—'}</td><td>${s.P??'—'}</td><td>${s.K??'—'}</td><td>${s.hum??'—'}</td><td>${s.temp??'—'}</td><td>${s.ec??'—'}</td><td>${s.ph??'—'}</td><td>${b.porcentaje??'—'}</td></tr>`}$('historial').innerHTML=h+'</tbody></table>';setEstado(`${d.cantidad} registros consultados desde SQLite.`,true)}catch(e){$('historial').textContent=e.message}}
+$('nodo').addEventListener('change',()=>{cargarConfig();$('historial').textContent='Pulsa «Consultar historial».';$('foto').removeAttribute('src')});
+cargarNodos();
+</script>
+</body></html>"""
+
+@app.get("/", response_class=HTMLResponse)
+def web_inicio():
+    return HTML_AGROTECH
+
+@app.get("/api/nodos")
+def api_nodos():
+    return {"nodos":[{"id":n["id"],"nombre":n["nombre"],"activo":n["activo"],"camera":n.get("camera_ip") is not None} for n in NODOS]}
+
+
+def _validar_nodo(nodo_id):
+    if nodo_id not in {n["id"] for n in NODOS}:
+        raise HTTPException(status_code=404, detail=f"Nodo no encontrado: {nodo_id}")
+
+
+@app.get("/api/nodos/{nodo_id}/ultimo")
+def api_ultimo(nodo_id: str):
+    _validar_nodo(nodo_id)
+    dato = sqlite_ultimo(nodo_id)
+    if dato is None:
+        raise HTTPException(status_code=404, detail="No existen mediciones para este nodo")
+    return dato
+
+
+@app.get("/api/nodos/{nodo_id}/historial")
+def api_historial(nodo_id: str, limite: int = 100):
+    _validar_nodo(nodo_id)
+    limite = max(1, min(limite, 5000))
+    datos = sqlite_historial(nodo_id, limite)
+    return {"nodo_id": nodo_id, "cantidad": len(datos), "datos": datos}
+
+
+def _foto_sqlite(nodo_id):
+    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+        return conn.execute("""
+            SELECT timestamp, imagen, tam_bytes
+            FROM fotos WHERE nodo_id = ?
+        """, (nodo_id,)).fetchone()
+
+
+@app.get("/api/nodos/{nodo_id}/foto")
+def api_foto(nodo_id: str):
+    _validar_nodo(nodo_id)
+    row = _foto_sqlite(nodo_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="El nodo todavía no tiene fotografías")
+    timestamp, imagen, tam_bytes = row
+    return Response(content=imagen, media_type="image/jpeg", headers={
+        "X-Foto-Timestamp": timestamp,
+        "X-Foto-Tamano": str(tam_bytes),
+    })
+
+
+@app.get("/api/nodos/{nodo_id}/foto/meta")
+def api_foto_meta(nodo_id: str):
+    _validar_nodo(nodo_id)
+    row = _foto_sqlite(nodo_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="El nodo todavía no tiene fotografías")
+    return {"nodo_id": nodo_id, "timestamp": row[0], "tam_bytes": row[2]}
+
+
+@app.get("/api/nodos/{nodo_id}/config")
+def api_config_get(nodo_id: str):
+    _validar_nodo(nodo_id)
+    cfg = sqlite_config(nodo_id)
+    return {"nodo_id": nodo_id, "horarios": _normalizar_horarios(cfg.get("horas", [])), "actualizado": cfg.get("actualizado", "—")}
+
+
+@app.post("/api/nodos/{nodo_id}/config")
+def api_config_post(nodo_id: str, config: ConfigHorarioAPI):
+    _validar_nodo(nodo_id)
+    horarios = _normalizar_horarios(config.horarios)
+    horarios = sorted(set(horarios), key=_minutos_desde_medianoche)
+    if not horarios:
+        raise HTTPException(status_code=400, detail="No se proporcionaron horarios válidos")
+    if len(horarios) > 1440:
+        raise HTTPException(status_code=400, detail="No se pueden superar 1440 horarios")
+
+    payload = json.dumps({
+        "horas": [int(h.split(":")[0]) for h in horarios],
+        "minutos": [int(h.split(":")[1]) for h in horarios],
+    })
+    ok = mqtt_publicar_config(payload, nodo_id)
+    mqtt_publicar_hora(nodo_id)
+    if not ok:
+        raise HTTPException(status_code=503, detail="No se pudo publicar la configuración mediante MQTT")
+
+    guardar_config_nodo(nodo_id, horarios)
+    if not guardar_config_sqlite(nodo_id, horarios):
+        raise HTTPException(status_code=500, detail="La configuración fue enviada por MQTT, pero no pudo guardarse en SQLite")
+
+    return {"ok": True, "nodo_id": nodo_id, "horarios": horarios, "mqtt": "enviado", "actualizado": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def fastapi_iniciar():
+    """Levanta FastAPI en un hilo daemon para convivir con Flet."""
+    def _run():
+        try:
+            print(f"[API] FastAPI escuchando en http://{FASTAPI_HOST}:{FASTAPI_PORT}")
+            uvicorn.run(app, host=FASTAPI_HOST, port=FASTAPI_PORT, log_level="info")
+        except Exception as e:
+            print(f"[API] No se pudo iniciar FastAPI: {e}")
+    hilo = threading.Thread(target=_run, daemon=True)
+    hilo.start()
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  COMPONENTES REUTILIZABLES
@@ -1095,7 +1161,7 @@ def build_nodos(on_volver, on_sel):
         ci=C["verde"] if activo else C["gris_texto"]
         ct=C["negro_texto"] if activo else C["gris_texto"]
         cd=C["verde_claro"] if activo else "#9E9E9E"
-        cfg = cargar_config_nodo(nodo["id"])
+        cfg = sqlite_config(nodo["id"])
         horas_list = cfg.get("horas", [10, 18])
         num_medidas = len(horas_list)
 
@@ -1406,7 +1472,7 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
 # ══════════════════════════════════════════════════════════════════════
 def build_config(nodo, page, on_volver):
     nodo_id = nodo["id"]
-    cfg = cargar_config_nodo(nodo_id)
+    cfg = sqlite_config(nodo_id)
     horarios_guardados = _normalizar_horarios(cfg.get("horas", ["10:00", "18:00"]))
 
     # Modos rápidos de 2 y 3 medidas + modo personalizado.
@@ -1883,6 +1949,7 @@ def build_config(nodo, page, on_volver):
         mqtt_publicar_hora(nodo_id)   # v13: sincroniza el DS3231 si el nodo esta en modo config
         if ok:
             guardar_config_nodo(nodo_id, horarios)
+            guardar_config_sqlite(nodo_id, horarios)
 
             resultado.bgcolor = C["verde_suave"]
             resultado.border = ft.Border.all(1.5, C["verde_borde"])
@@ -2263,18 +2330,18 @@ def main(page: ft.Page):
 
     cont = ft.Container(expand=True)
 
-    # Iniciar MQTT global desde el principio (sensores/status/config)
+    # Persistencia SQLite: fuente de verdad para la API web.
+    sqlite_iniciar()
+
+    # Iniciar MQTT global desde el principio (sensores/status/config).
     def global_update():
         """Callback para actualizaciones globales de MQTT."""
         page.update()
 
     mqtt_iniciar_global(global_update)
 
-    # Persistencia nueva: SQLite conserva todo el historial de mediciones.
-    sqlite_iniciar()
-
-    # Comunicación externa: WebSocket para HTML y otros clientes.
-    websocket_iniciar()
+    # API REST + página HTML para clientes externos.
+    fastapi_iniciar()
 
     # Servidor HTTP de fotos del ESP32-S3 CAM.
     http_photo_server_iniciar()
