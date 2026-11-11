@@ -9,6 +9,8 @@ v3.2 — Cambios principales:
 - NUEVO: FastAPI + página HTML para consultas y configuración mediante REST.
 - WebSocket eliminado: el navegador realiza solicitudes bajo demanda.
   MQTT se conserva para sensores, status y configuración de horario.
+- NUEVO: sincronización Raspberry <-> main.py para configuraciones remotas
+  de horarios, con versionado, confirmación de publicación y configok.
 
 v12 - CORRECCIONES (firmware nodo2_esp32s3_v12.ino):
   1) mqtt_publicar_config() ahora publica con qos=1 y retain=True y espera
@@ -78,6 +80,12 @@ CLOUD_API_KEY = "cM5STVFFparbVC6RuZmlEYB-B_H4GCSIwbWNulekgFDL3CpLlqRiTIvCCzko6id
 CLOUD_TIMEOUT = 15
 CLOUD_SYNC_INTERVAL = 30
 
+# SINCRONIZACIÓN REMOTA DE HORARIOS
+# La nube (main.py) conserva la configuración hasta que la Raspberry
+# confirma que la publicó por MQTT. El ESP32 recibe el JSON por MQTT
+# en esp32/<nodo_id>/config con retain=True.
+CONFIG_CLOUD_SYNC_INTERVAL = 30
+
 DATA_DIR    = os.path.expanduser("~/agrotech/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -104,79 +112,6 @@ C = {
 # ══════════════════════════════════════════════════════════════════════
 #  SQLITE — ALMACENAMIENTO HISTÓRICO
 # ══════════════════════════════════════════════════════════════════════
-def sqlite_importar_fotos_existentes():
-    """
-    Importa a SQLite las fotografías JPG históricas que ya existen en
-    ~/agrotech/data y que todavía no tienen un registro en la tabla fotos.
-
-    Solo reconoce nombres generados por AgroTech:
-        cam_nodo1_YYYYMMDD_HHMMSS.jpg
-        cam_nodo1_YYYYMMDD_HHMMSS_ffffff.jpg
-
-    Las fotos importadas quedan con enviado=0 para que la sincronización
-    con la nube pueda enviarlas también.
-    """
-    import re
-    import glob
-
-    patron = re.compile(
-        r"^cam_(nodo[1-4])_(\d{8})_(\d{6})(?:_\d{6})?\.jpg$",
-        re.IGNORECASE
-    )
-
-    try:
-        archivos = glob.glob(os.path.join(DATA_DIR, "cam_nodo*.jpg"))
-        importadas = 0
-
-        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-            for ruta in sorted(archivos):
-                nombre = os.path.basename(ruta)
-                match = patron.match(nombre)
-                if not match:
-                    continue
-
-                nodo_id, fecha, hora = match.groups()
-                timestamp = datetime.strptime(
-                    f"{fecha}_{hora}", "%Y%m%d_%H%M%S"
-                ).strftime("%Y-%m-%d %H:%M:%S")
-
-                # Si ya existe una foto con ese nodo y timestamp, no se duplica.
-                existe = conn.execute("""
-                    SELECT id FROM fotos
-                    WHERE nodo_id = ? AND timestamp = ?
-                    LIMIT 1
-                """, (nodo_id, timestamp)).fetchone()
-                if existe:
-                    continue
-
-                with open(ruta, "rb") as f:
-                    imagen = f.read()
-
-                if not imagen:
-                    continue
-
-                conn.execute("""
-                    INSERT INTO fotos
-                        (nodo_id, timestamp, imagen, tam_bytes, enviado)
-                    VALUES (?, ?, ?, ?, 0)
-                """, (
-                    nodo_id,
-                    timestamp,
-                    sqlite3.Binary(imagen),
-                    len(imagen)
-                ))
-                importadas += 1
-
-            conn.commit()
-
-        if importadas:
-            print(f"[SQLITE] Fotos históricas importadas desde carpeta: {importadas}")
-            solicitar_sincronizacion() if '_sync_event' in globals() else None
-
-    except Exception as e:
-        print(f"[SQLITE] Error importando fotos históricas: {e}")
-
-
 def sqlite_iniciar():
     """Crea la base de datos y la tabla de mediciones si no existen."""
     try:
@@ -204,57 +139,32 @@ def sqlite_iniciar():
                 CREATE INDEX IF NOT EXISTS idx_mediciones_nodo_fecha
                 ON mediciones(nodo_id, timestamp)
             """)
-            # Tabla histórica de fotografías.
-            # Cada foto tiene su propio ID, por lo que un nodo puede tener
-            # tantas fotografías como sean necesarias.
-            columnas_fotos_existentes = {row[1] for row in conn.execute(
-                "PRAGMA table_info(fotos)").fetchall()}
-
-            if columnas_fotos_existentes and "id" not in columnas_fotos_existentes:
-                # Migración de la versión anterior: allí nodo_id era PRIMARY KEY
-                # y solo podía existir una foto por nodo. Conservamos esas
-                # últimas fotos y las pasamos al nuevo esquema histórico.
-                conn.execute("ALTER TABLE fotos RENAME TO fotos_legacy")
-
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS fotos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nodo_id TEXT NOT NULL,
+                    nodo_id TEXT PRIMARY KEY,
                     timestamp TEXT NOT NULL,
                     imagen BLOB NOT NULL,
-                    tam_bytes INTEGER NOT NULL,
-                    enviado INTEGER NOT NULL DEFAULT 0,
-                    UNIQUE(nodo_id, timestamp)
+                    tam_bytes INTEGER NOT NULL
                 )
             """)
-
-            if columnas_fotos_existentes and "id" not in columnas_fotos_existentes:
-                # Copiar la última foto que existía en el esquema antiguo.
-                columnas_legacy = {row[1] for row in conn.execute(
-                    "PRAGMA table_info(fotos_legacy)").fetchall()}
-                tiene_enviado = "enviado" in columnas_legacy
-                conn.execute(f"""
-                    INSERT OR IGNORE INTO fotos
-                        (nodo_id, timestamp, imagen, tam_bytes, enviado)
-                    SELECT nodo_id, timestamp, imagen, tam_bytes,
-                           {"enviado" if tiene_enviado else "0"}
-                    FROM fotos_legacy
-                """)
-                conn.execute("DROP TABLE fotos_legacy")
-
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_fotos_nodo_fecha
-                ON fotos(nodo_id, timestamp)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_fotos_enviado
-                ON fotos(enviado, id)
-            """)
-
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS configuraciones (
                     nodo_id TEXT PRIMARY KEY,
                     horarios TEXT NOT NULL,
+                    actualizado TEXT NOT NULL
+                )
+            """)
+
+            # Control local de la sincronización de horarios con main.py.
+            # Permite asociar un configok del ESP32 con la versión exacta
+            # que la Raspberry publicó, incluso después de reiniciar.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS config_nube_sync (
+                    nodo_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    horarios TEXT NOT NULL DEFAULT '[]',
+                    publicada INTEGER NOT NULL DEFAULT 0,
+                    aplicada INTEGER NOT NULL DEFAULT 0,
                     actualizado TEXT NOT NULL
                 )
             """)
@@ -268,13 +178,23 @@ def sqlite_iniciar():
                     "ALTER TABLE mediciones ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
                 )
 
+            columnas_foto = {row[1] for row in conn.execute(
+                "PRAGMA table_info(fotos)").fetchall()}
+            if "enviado" not in columnas_foto:
+                conn.execute(
+                    "ALTER TABLE fotos ADD COLUMN enviado INTEGER NOT NULL DEFAULT 0"
+                )
+
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_mediciones_enviado
                 ON mediciones(enviado, id)
             """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fotos_enviado
+                ON fotos(enviado, nodo_id)
+            """)
             conn.commit()
         print(f"[SQLITE] Base de datos lista: {SQLITE_DB}")
-        sqlite_importar_fotos_existentes()
         return True
     except Exception as e:
         print(f"[SQLITE] Error inicializando: {e}")
@@ -415,124 +335,102 @@ def sqlite_marcar_medicion_enviada(id_medicion):
         )
         conn.commit()
 
-def sqlite_fotos_pendientes(limite=100):
+def sqlite_fotos_pendientes():
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         return conn.execute("""
-            SELECT id, nodo_id, timestamp, imagen, tam_bytes
+            SELECT nodo_id, timestamp, imagen, tam_bytes
             FROM fotos
             WHERE enviado = 0
-            ORDER BY id ASC
-            LIMIT ?
-        """, (limite,)).fetchall()
+            ORDER BY timestamp ASC
+        """).fetchall()
 
-def sqlite_marcar_foto_enviada(id_foto):
+def sqlite_marcar_foto_enviada(nodo_id, timestamp):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         conn.execute("""
             UPDATE fotos SET enviado = 1
-            WHERE id = ?
-        """, (id_foto,))
+            WHERE nodo_id = ? AND timestamp = ?
+        """, (nodo_id, timestamp))
         conn.commit()
 
 def solicitar_sincronizacion():
     _sync_event.set()
 
 def sincronizar_con_nube():
-    """
-    Envía todos los registros pendientes que pueda mientras haya conexión.
-
-    - enviado=0: pendiente.
-    - enviado=1: confirmado por la nube.
-    - Si falla la conexión o la nube rechaza un elemento, ese elemento queda
-      en 0 y se detiene el ciclo actual para reintentarlo más tarde.
-    - Cuando la conexión funciona, se procesan lotes sucesivos hasta que no
-      queden mediciones ni fotos pendientes.
-    """
+    """Envía solo pendientes y confirma cada elemento individualmente."""
     if not CLOUD_SERVER_URL or "TU-DOMINIO" in CLOUD_SERVER_URL:
-        print("[SYNC] CLOUD_SERVER_URL no está configurada; sincronización omitida.")
         return
 
-    print("[SYNC] Comprobando datos y fotos pendientes...")
+    for id_local, nodo_id, timestamp, payload in sqlite_mediciones_pendientes():
+        try:
+            datos_originales = json.loads(payload)
+            # La bandera es estrictamente local y nunca viaja a la nube.
+            datos_originales.pop("enviado", None)
 
-    # Primero vaciamos todas las mediciones pendientes.
-    while True:
-        pendientes = sqlite_mediciones_pendientes(limite=100)
-        if not pendientes:
+            # El ESP32/Raspberry guarda localmente solo dht/suelo/bateria,
+            # pero la API de la nube exige además tipo, nodo_id y timestamp.
+            # Construimos aquí el formato del contrato de la nube sin alterar
+            # el payload original almacenado en SQLite.
+            datos = {
+                "tipo": "lectura",
+                "nodo_id": nodo_id,
+                "timestamp": timestamp,
+                **datos_originales,
+            }
+
+            numero_nodo = nodo_id.replace("nodo", "", 1)
+            respuesta = requests.post(
+                _cloud_url(f"/api/nodos/{numero_nodo}/datos"),
+                json=datos,
+                headers=_cloud_headers(),
+                timeout=CLOUD_TIMEOUT
+            )
+
+            if not respuesta.ok:
+                print(f"[SYNC] HTTP {respuesta.status_code} medición {id_local}: {respuesta.text[:300]}")
+                break
+
+            cuerpo = respuesta.json()
+            if cuerpo.get("ok") is True:
+                sqlite_marcar_medicion_enviada(id_local)
+                print(f"[SYNC] Medición local {id_local} confirmada por nube.")
+            else:
+                print(f"[SYNC] Nube rechazó medición {id_local}: {cuerpo}")
+                break
+
+        except Exception as e:
+            print(f"[SYNC] Error enviando medición {id_local}: {e}")
             break
 
-        for id_local, nodo_id, timestamp, payload in pendientes:
-            try:
-                datos_originales = json.loads(payload)
-                datos_originales.pop("enviado", None)
+    for nodo_id, timestamp, imagen, tam_bytes in sqlite_fotos_pendientes():
+        try:
+            numero_nodo = nodo_id.replace("nodo", "", 1)
+            respuesta = requests.post(
+                _cloud_url(f"/api/nodos/{numero_nodo}/foto"),
+                params={"timestamp": timestamp},
+                data=imagen,
+                headers={
+                    "X-API-Key": CLOUD_API_KEY,
+                    "Content-Type": "image/jpeg",
+                    "X-Foto-Timestamp": timestamp,
+                },
+                timeout=CLOUD_TIMEOUT
+            )
 
-                datos = {
-                    "tipo": "lectura",
-                    "nodo_id": nodo_id,
-                    "timestamp": timestamp,
-                    **datos_originales,
-                }
+            if not respuesta.ok:
+                print(f"[SYNC] HTTP {respuesta.status_code} foto {nodo_id}: {respuesta.text[:300]}")
+                break
 
-                numero_nodo = nodo_id.replace("nodo", "", 1)
-                respuesta = requests.post(
-                    _cloud_url(f"/api/nodos/{numero_nodo}/datos"),
-                    json=datos,
-                    headers=_cloud_headers(),
-                    timeout=CLOUD_TIMEOUT
-                )
+            cuerpo = respuesta.json()
+            if cuerpo.get("ok") is True:
+                sqlite_marcar_foto_enviada(nodo_id, timestamp)
+                print(f"[SYNC] Foto de {nodo_id} confirmada por nube.")
+            else:
+                print(f"[SYNC] Nube rechazó foto de {nodo_id}: {cuerpo}")
+                break
 
-                if not respuesta.ok:
-                    print(f"[SYNC] HTTP {respuesta.status_code} medición {id_local}: {respuesta.text[:300]}")
-                    return
-
-                cuerpo = respuesta.json()
-                if cuerpo.get("ok") is True:
-                    sqlite_marcar_medicion_enviada(id_local)
-                    print(f"[SYNC] Medición local {id_local} confirmada por nube.")
-                else:
-                    print(f"[SYNC] Nube rechazó medición {id_local}: {cuerpo}")
-                    return
-
-            except Exception as e:
-                print(f"[SYNC] Error enviando medición {id_local}: {e}")
-                return
-
-    # Después vaciamos todas las fotografías pendientes.
-    while True:
-        pendientes = sqlite_fotos_pendientes(limite=25)
-        if not pendientes:
+        except Exception as e:
+            print(f"[SYNC] Error enviando foto de {nodo_id}: {e}")
             break
-
-        for id_foto, nodo_id, timestamp, imagen, tam_bytes in pendientes:
-            try:
-                numero_nodo = nodo_id.replace("nodo", "", 1)
-                respuesta = requests.post(
-                    _cloud_url(f"/api/nodos/{numero_nodo}/foto"),
-                    params={"timestamp": timestamp},
-                    data=imagen,
-                    headers={
-                        "X-API-Key": CLOUD_API_KEY,
-                        "Content-Type": "image/jpeg",
-                        "X-Foto-Timestamp": timestamp,
-                    },
-                    timeout=CLOUD_TIMEOUT
-                )
-
-                if not respuesta.ok:
-                    print(f"[SYNC] HTTP {respuesta.status_code} foto local {id_foto} ({nodo_id}): {respuesta.text[:300]}")
-                    return
-
-                cuerpo = respuesta.json()
-                if cuerpo.get("ok") is True:
-                    sqlite_marcar_foto_enviada(id_foto)
-                    print(f"[SYNC] Foto local {id_foto} de {nodo_id} confirmada por nube.")
-                else:
-                    print(f"[SYNC] Nube rechazó foto local {id_foto} de {nodo_id}: {cuerpo}")
-                    return
-
-            except Exception as e:
-                print(f"[SYNC] Error enviando foto local {id_foto} de {nodo_id}: {e}")
-                return
-
-    print("[SYNC] Sincronización completada: no quedan pendientes.")
 
 def sincronizador_iniciar():
     def _run():
@@ -844,6 +742,9 @@ def mqtt_iniciar_global(on_update):
                 ack["recibido"] = datetime.now().strftime("%H:%M:%S")
                 estado_config_ack[nid] = ack
                 print(f"[MQTT] CONFIRMACION de {nid}: {texto}")
+                # La confirmación del ESP32 cierra el ciclo:
+                # main.py -> Raspberry -> MQTT -> ESP32 -> MQTT -> main.py
+                _procesar_configok_nube(nid, ack)
                 notificar_actualizacion()
                 on_update()
                 return
@@ -1021,6 +922,314 @@ def mqtt_borrar_config_retenida(nodo_id: str = "nodo2") -> bool:
         return False
 
 # ══════════════════════════════════════════════════════════════════════
+#  SINCRONIZACIÓN DE CONFIGURACIONES DE HORARIO CON LA NUBE
+# ══════════════════════════════════════════════════════════════════════
+_config_sync_event = threading.Event()
+_config_sync_lock = threading.Lock()
+
+
+def _horarios_desde_payload_config(valor):
+    """Convierte la configuración remota a una lista HH:MM.
+
+    Acepta tanto el formato que entrega main.py:
+        ["06:00", "12:30"]
+    como el formato compacto que usa el ESP32:
+        {"horas": [6, 12], "minutos": [0, 30]}
+    """
+    try:
+        if isinstance(valor, dict):
+            if isinstance(valor.get("horarios"), list):
+                return _normalizar_horarios(valor.get("horarios"))
+
+            horas = valor.get("horas")
+            minutos = valor.get("minutos")
+            if isinstance(horas, list) and isinstance(minutos, list):
+                if len(horas) != len(minutos):
+                    return []
+                return _normalizar_horarios([
+                    f"{int(h):02d}:{int(m):02d}"
+                    for h, m in zip(horas, minutos)
+                ])
+
+        if isinstance(valor, list):
+            return _normalizar_horarios(valor)
+    except (TypeError, ValueError):
+        pass
+    return []
+
+
+def _config_nube_guardar_local(nodo_id, version, horarios, publicada=False, aplicada=False):
+    """Guarda localmente qué versión de main.py se publicó al ESP32."""
+    try:
+        horarios = _normalizar_horarios(horarios)
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            conn.execute("""
+                INSERT INTO config_nube_sync
+                    (nodo_id, version, horarios, publicada, aplicada, actualizado)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(nodo_id) DO UPDATE SET
+                    version=excluded.version,
+                    horarios=excluded.horarios,
+                    publicada=excluded.publicada,
+                    aplicada=excluded.aplicada,
+                    actualizado=excluded.actualizado
+            """, (
+                nodo_id,
+                int(version),
+                json.dumps(horarios),
+                1 if publicada else 0,
+                1 if aplicada else 0,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ))
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[CONFIG-CLOUD] Error guardando estado local de {nodo_id}: {e}")
+        return False
+
+
+def _config_nube_obtener_local(nodo_id):
+    try:
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            row = conn.execute("""
+                SELECT version, horarios, publicada, aplicada
+                FROM config_nube_sync
+                WHERE nodo_id = ?
+            """, (nodo_id,)).fetchone()
+        if not row:
+            return None
+        return {
+            "version": row[0],
+            "horarios": _normalizar_horarios(json.loads(row[1] or "[]")),
+            "publicada": bool(row[2]),
+            "aplicada": bool(row[3]),
+        }
+    except Exception as e:
+        print(f"[CONFIG-CLOUD] Error leyendo estado local de {nodo_id}: {e}")
+        return None
+
+
+def _config_cloud_confirmar(nodo_numero, version, estado, detalle=""):
+    """Informa a main.py que la Raspberry publicó o que el ESP aplicó."""
+    try:
+        respuesta = requests.post(
+            _cloud_url(f"/api/nodos/{nodo_numero}/configuracion/confirmar"),
+            json={
+                "version": int(version),
+                "estado": estado,
+                "detalle": str(detalle)[:300],
+            },
+            headers=_cloud_headers(),
+            timeout=CLOUD_TIMEOUT,
+        )
+        if not respuesta.ok:
+            print(
+                f"[CONFIG-CLOUD] HTTP {respuesta.status_code} confirmando "
+                f"nodo{nodo_numero} v{version}: {respuesta.text[:300]}"
+            )
+            return False
+
+        cuerpo = respuesta.json()
+        if cuerpo.get("ok") is not True:
+            print(f"[CONFIG-CLOUD] Nube rechazó confirmación: {cuerpo}")
+            return False
+
+        print(
+            f"[CONFIG-CLOUD] Confirmación '{estado}' enviada para "
+            f"nodo{nodo_numero}, versión {version}."
+        )
+        return True
+    except Exception as e:
+        print(
+            f"[CONFIG-CLOUD] Error confirmando nodo{nodo_numero} "
+            f"v{version}: {e}"
+        )
+        return False
+
+
+def sincronizar_configuraciones_con_nube():
+    """Descarga configuraciones pendientes de main.py y las traduce a JSON ESP32.
+
+    Flujo:
+      1. main.py entrega {nodo, version, horarios:[HH:MM,...]}.
+      2. Raspberry convierte a {horas:[...], minutos:[...]}.
+      3. Publica en esp32/<nodo_id>/config con QoS 1 + retain=True.
+      4. Solo si MQTT confirma la publicación, main.py recibe 'publicada'.
+      5. El ESP32 puede aplicar el horario al despertar y responder /configok.
+      6. Al recibir /configok, la Raspberry confirma 'aplicada' a main.py.
+    """
+    if not CLOUD_SERVER_URL or "TU-DOMINIO" in CLOUD_SERVER_URL:
+        return
+
+    try:
+        respuesta = requests.get(
+            _cloud_url("/api/configuracion/pendientes"),
+            headers={"X-API-Key": CLOUD_API_KEY},
+            timeout=CLOUD_TIMEOUT,
+        )
+        if not respuesta.ok:
+            print(
+                f"[CONFIG-CLOUD] HTTP {respuesta.status_code} consultando "
+                f"pendientes: {respuesta.text[:300]}"
+            )
+            return
+
+        cuerpo = respuesta.json()
+        pendientes = cuerpo.get("pendientes", [])
+        if not pendientes:
+            return
+
+        print(f"[CONFIG-CLOUD] {len(pendientes)} configuración(es) pendiente(s).")
+
+        for pendiente in pendientes:
+            try:
+                nodo_numero = int(pendiente["nodo"])
+                nodo_id = str(pendiente.get("nodo_id") or f"nodo{nodo_numero}")
+                version = int(pendiente["version"])
+                horarios = _horarios_desde_payload_config(pendiente.get("horarios", []))
+
+                if nodo_numero not in (1, 2, 3, 4) or not horarios:
+                    print(
+                        f"[CONFIG-CLOUD] Configuración inválida para {nodo_id}: "
+                        f"{pendiente}"
+                    )
+                    continue
+
+                payload = json.dumps({
+                    "horas": [int(h.split(":")[0]) for h in horarios],
+                    "minutos": [int(h.split(":")[1]) for h in horarios],
+                })
+
+                # Si main.py tiene una versión nueva, reemplazamos la anterior
+                # en la cola local. El mensaje MQTT retain también queda con la
+                # versión más reciente cuando se publica correctamente.
+                with _config_sync_lock:
+                    _config_nube_guardar_local(
+                        nodo_id,
+                        version,
+                        horarios,
+                        publicada=False,
+                        aplicada=False,
+                    )
+
+                print(
+                    f"[CONFIG-CLOUD] nodo{nodo_numero} v{version}: "
+                    f"{horarios} -> {payload}"
+                )
+
+                # mqtt_publicar_config() usa QoS 1 y retain=True.
+                # Esto permite que un ESP dormido reciba el último horario
+                # cuando vuelva a conectarse al broker.
+                publicado = mqtt_publicar_config(payload, nodo_id)
+
+                if not publicado:
+                    print(
+                        f"[CONFIG-CLOUD] No se pudo publicar nodo{nodo_numero} "
+                        f"v{version}; seguirá pendiente en main.py."
+                    )
+                    continue
+
+                _config_nube_guardar_local(
+                    nodo_id,
+                    version,
+                    horarios,
+                    publicada=True,
+                    aplicada=False,
+                )
+
+                # Sincroniza el RTC solo si el nodo está despierto; el mensaje
+                # NO es retenido y por tanto no puede reajustar el reloj con una
+                # fecha antigua cuando el ESP despierte horas después.
+                mqtt_publicar_hora(nodo_id)
+
+                _config_cloud_confirmar(
+                    nodo_numero,
+                    version,
+                    "publicada",
+                    "Configuración publicada por MQTT con QoS 1 y retain=True",
+                )
+
+            except Exception as e:
+                print(f"[CONFIG-CLOUD] Error procesando configuración: {e}")
+
+    except requests.RequestException as e:
+        print(f"[CONFIG-CLOUD] Sin conexión con main.py: {e}")
+    except Exception as e:
+        print(f"[CONFIG-CLOUD] Error general: {e}")
+
+
+def solicitar_sincronizacion_configuraciones():
+    _config_sync_event.set()
+
+
+def _procesar_configok_nube(nodo_id, ack):
+    """Cuando el ESP32 confirma, marca la versión correspondiente en main.py."""
+    horarios_ack = _horarios_desde_payload_config(ack)
+    if not horarios_ack:
+        print(f"[CONFIG-CLOUD] configok de {nodo_id} no contiene horarios válidos: {ack}")
+        return
+
+    local = _config_nube_obtener_local(nodo_id)
+    if not local:
+        print(
+            f"[CONFIG-CLOUD] configok de {nodo_id} recibido, pero no hay "
+            "versión local asociada. No se marca aplicada en la nube."
+        )
+        return
+
+    if horarios_ack != local["horarios"]:
+        print(
+            f"[CONFIG-CLOUD] configok de {nodo_id} NO coincide con v{local['version']}. "
+            f"Esperado={local['horarios']} recibido={horarios_ack}."
+        )
+        return
+
+    if not local["publicada"]:
+        print(
+            f"[CONFIG-CLOUD] configok de {nodo_id} coincide, pero la versión "
+            "aún no figura como publicada localmente."
+        )
+        return
+
+    nodo_numero = int(nodo_id.replace("nodo", "", 1))
+    if _config_cloud_confirmar(
+        nodo_numero,
+        local["version"],
+        "aplicada",
+        "El ESP32 confirmó por MQTT que guardó el horario recibido",
+    ):
+        _config_nube_guardar_local(
+            nodo_id,
+            local["version"],
+            local["horarios"],
+            publicada=True,
+            aplicada=True,
+        )
+
+
+def sincronizador_configuraciones_iniciar():
+    """Hilo periódico: consulta main.py cada 30 s y al arrancar."""
+    def _run():
+        while True:
+            _config_sync_event.wait(timeout=CONFIG_CLOUD_SYNC_INTERVAL)
+            _config_sync_event.clear()
+            try:
+                sincronizar_configuraciones_con_nube()
+            except Exception as e:
+                print(f"[CONFIG-CLOUD] Error en ciclo: {e}")
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name="agrotech-config-cloud-sync",
+    ).start()
+
+    # Recupera inmediatamente una configuración que haya quedado pendiente
+    # mientras la Raspberry estaba apagada.
+    solicitar_sincronizacion_configuraciones()
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  CÁMARA
 #  Las imágenes se reciben y guardan SIEMPRE, estés o no dentro del
 #  dashboard del nodo. La UI se actualiza si los controles están activos;
@@ -1078,9 +1287,7 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
     ahora recibe directamente los bytes binarios del POST HTTP.
     """
     try:
-        # Microsegundos para evitar que dos fotos del mismo nodo recibidas
-        # durante el mismo segundo sobrescriban el archivo anterior.
-        nombre  = f"cam_{nodo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        nombre  = f"cam_{nodo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         ruta_jpg = os.path.join(DATA_DIR, nombre)
         with open(ruta_jpg, "wb") as f:
             f.write(img_bytes)
@@ -1091,22 +1298,18 @@ def _procesar_imagen_recibida(nodo_id: str, img_bytes: bytes):
         tam_kb    = len(img_bytes) // 1024
         timestamp_foto = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # ── Persistir TODAS las fotos en SQLite ──
-        # Cada foto obtiene una fila propia y queda pendiente (enviado=0)
-        # hasta que la nube confirme su recepción.
+        # ── Persistir la última foto en SQLite (fuente de la API REST) ──
         try:
             with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-                cursor = conn.execute("""
-                    INSERT INTO fotos (nodo_id, timestamp, imagen, tam_bytes, enviado)
-                    VALUES (?, ?, ?, ?, 0)
-                    ON CONFLICT(nodo_id, timestamp) DO UPDATE SET
+                conn.execute("""
+                    INSERT INTO fotos (nodo_id, timestamp, imagen, tam_bytes)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(nodo_id) DO UPDATE SET
+                        timestamp=excluded.timestamp,
                         imagen=excluded.imagen,
-                        tam_bytes=excluded.tam_bytes,
-                        enviado=0
+                        tam_bytes=excluded.tam_bytes
                 """, (nodo_id, timestamp_foto, sqlite3.Binary(img_bytes), len(img_bytes)))
-                id_foto = cursor.lastrowid
                 conn.commit()
-            print(f"[SQLITE] Foto {id_foto or 'existente'} de {nodo_id} guardada en historial.")
             solicitar_sincronizacion()
         except Exception as e:
             print(f"[SQLITE] Error guardando foto de {nodo_id}: {e}")
@@ -1309,10 +1512,7 @@ def _foto_sqlite(nodo_id):
     with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
         return conn.execute("""
             SELECT timestamp, imagen, tam_bytes
-            FROM fotos
-            WHERE nodo_id = ?
-            ORDER BY id DESC
-            LIMIT 1
+            FROM fotos WHERE nodo_id = ?
         """, (nodo_id,)).fetchone()
 
 
@@ -1336,28 +1536,6 @@ def api_foto_meta(nodo_id: str):
     if row is None:
         raise HTTPException(status_code=404, detail="El nodo todavía no tiene fotografías")
     return {"nodo_id": nodo_id, "timestamp": row[0], "tam_bytes": row[2]}
-
-
-@app.get("/api/nodos/{nodo_id}/fotos/historial")
-def api_historial_fotos(nodo_id: str, limite: int = 100):
-    _validar_nodo(nodo_id)
-    limite = max(1, min(limite, 5000))
-    with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-        rows = conn.execute("""
-            SELECT id, timestamp, tam_bytes, enviado
-            FROM fotos
-            WHERE nodo_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (nodo_id, limite)).fetchall()
-    return {
-        "nodo_id": nodo_id,
-        "cantidad": len(rows),
-        "fotos": [
-            {"id": r[0], "timestamp": r[1], "tam_bytes": r[2], "enviado": r[3]}
-            for r in rows
-        ]
-    }
 
 
 @app.get("/api/nodos/{nodo_id}/config")
@@ -2687,6 +2865,11 @@ def main(page: ft.Page):
         page.update()
 
     mqtt_iniciar_global(global_update)
+
+    # Sincronización de configuraciones de horarios desde main.py.
+    # Se inicia después de MQTT para que los configok del ESP32 puedan
+    # ser recibidos desde el primer momento.
+    sincronizador_configuraciones_iniciar()
 
     # API REST + página HTML para clientes externos.
     fastapi_iniciar()
