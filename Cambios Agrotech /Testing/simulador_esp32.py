@@ -1,35 +1,15 @@
 """
-AgroTech - Simulador de ESP32
---------------------------------
+AgroTech - Simulador de ESP32 (Versión con ML Testing y CLI)
+------------------------------------------------------------
 Emula uno o varios nodos ESP32 enviando:
+1) Sensores por MQTT (Topic: esp32/<nodo>/data)
+2) Fotografías por HTTP (POST http://<servidor>:8080/upload?nodo=<nodo>)
 
-1) Sensores por MQTT:
-   Topic: esp32/<nodo>/data
-
-2) Fotografías por HTTP:
-   POST http://<servidor>:8080/upload?nodo=<nodo>
-
-El formato de los datos MQTT coincide con el que espera
-agrotech_app_v11(1).py.
-
-Requisitos:
-    pip install paho-mqtt
-
-Uso rápido:
-    1. Configura IMAGE_DIR más abajo.
-    2. Ejecuta primero agrotech_app_v11(1).py.
-    3. Asegúrate de tener un broker MQTT en localhost:1883.
-    4. Ejecuta:
-           python simulador_esp32.py
-
-Para simular más nodos:
-    SIMULATED_NODES = ["nodo1", "nodo2", "nodo3", "nodo4"]
-
-IMPORTANTE:
-- La carpeta de imágenes debe existir en el ordenador donde se ejecuta
-  este simulador.
-- El simulador elige una imagen aleatoria en cada envío HTTP.
-- Por defecto se reutilizan imágenes; no se eliminan ni modifican.
+NUEVAS FUNCIONES (Testing Machine Learning):
+- Consola interactiva para cambiar el comportamiento en tiempo real.
+- Modo "Planta Sana": Datos dentro de lo esperado.
+- Modo "Planta Enferma": Genera anomalías severas (para probar Isolation Forest).
+- Control de Piramómetro: Habilita/Inhabilita el envío del campo de radiación.
 """
 
 import json
@@ -44,117 +24,100 @@ from datetime import datetime
 
 import paho.mqtt.client as mqtt
 
-
 # ============================================================
 # CONFIGURACIÓN PRINCIPAL
 # ============================================================
 
-# Broker MQTT al que se conecta el simulador.
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 
-# Servidor HTTP donde está ejecutándose AgroTech.
 HTTP_SERVER_HOST = "127.0.0.1"
 HTTP_PHOTO_PORT = 8080
 HTTP_PHOTO_PATH = "/upload"
 
 # >>> CAMBIA ESTA RUTA POR LA CARPETA REAL DE TUS IMÁGENES <<<
-#
-# Windows, ejemplos:
-# IMAGE_DIR = r"C:\Users\Usuario\Desktop\Wallpapers"
-# IMAGE_DIR = r"D:\Proyecto\imagenes"
-#
-# También puedes usar:
-# IMAGE_DIR = os.path.expanduser("~/Pictures/AgroTech")
+IMAGE_DIR = r"C:\Users\Usuario\Desktop\fotos de plantas para agrotech"
 
-
-
-
-IMAGE_DIR = r"C:\Users\Usuario\Desktop\Wallpapers"
-
-
-
-
-# Nodos que quieres simular.
-# Para probar solamente el nodo que actualmente está activo
-# en tu aplicación, deja únicamente "nodo1".
 SIMULATED_NODES = [
-    "nodo1",
-    "nodo2",
+    "nodo2"
 ]
 
-# Cada cuánto se genera y publica una lectura MQTT.
-SENSOR_INTERVAL_SECONDS = 15
-
-# Cada cuánto se envía una fotografía HTTP.
-PHOTO_INTERVAL_SECONDS = 15
-
-# True: una fotografía se envía inmediatamente al arrancar.
+SENSOR_INTERVAL_SECONDS = 30
+PHOTO_INTERVAL_SECONDS = 30
 SEND_PHOTO_ON_START = True
 
-# Extensiones de imágenes aceptadas.
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".bmp", ".webp"
 }
 
-
-# ============================================================
-# CONFIRMACIÓN DE HORARIOS (esp32/<nodo>/configok)
-# ============================================================
-#
-# AgroTech (v12/v13) publica la config en esp32/<nodo_id>/config y luego
-# espera, durante unos segundos, una respuesta en esp32/<nodo_id>/configok
-# para saber que el nodo realmente guardó el horario. Si no llega nada,
-# la app asume que el nodo está dormido.
-
-# True: el simulador responde automáticamente a cada configuración recibida.
+# Confirmación de horarios (esp32/<nodo>/configok)
 CONFIRM_HORARIOS = True
-
-# Rango de espera (segundos) antes de responder, para imitar el tiempo
-# real que tarda un ESP32 en despertar/procesar y publicar su ACK.
 CONFIRM_DELAY_SECONDS = (1.0, 3.0)
-
-# Probabilidad (0.0 a 1.0) de que el nodo realmente confirme. Bájala para
-# simular nodos dormidos/desconectados que no responden a tiempo.
 CONFIRM_PROBABILITY = 1.0
+
+
+# ============================================================
+# VARIABLES DE ESTADO GLOBALES PARA LA CONSOLA (CLI)
+# ============================================================
+sim_mode = "sana"      # Opciones: "sana", "enferma"
+sim_pira = True        # Opciones: True, False
 
 
 # ============================================================
 # RANGOS DE LOS SENSORES
 # ============================================================
-#
-# Puedes modificar libremente estos valores para representar
-# las condiciones de tu cultivo.
 
-RANGES = {
-    # DHT22
-    "dht_temp": (18.0, 32.0),       # °C
-    "dht_humidity": (45.0, 90.0),   # %
+# Rangos normales (Modo Planta Sana)
+RANGES_SANA = {
+    "dht_temp": (20.0, 30.0),       
+    "dht_humidity": (50.0, 80.0),   
+    "soil_N": (20, 40),            
+    "soil_P": (15, 30),            
+    "soil_K": (50, 150),            
+    "soil_humidity": (25.0, 45.0),  
+    "soil_temp": (20.0, 35.0),      
+    "soil_ec": (200, 400),         
+    "soil_ph": (5.5, 6.5),          
+    "battery": (21.0, 100.0),       
+    "piramometro_rad": (100.0, 1000.0) 
+}
 
-    # Sensor de suelo
-    "soil_N": (20, 180),            # mg/kg
-    "soil_P": (10, 100),            # mg/kg
-    "soil_K": (30, 250),            # mg/kg
-    "soil_humidity": (25.0, 85.0),  # %
-    "soil_temp": (17.0, 30.0),      # °C
-    "soil_ec": (200, 1800),         # µS/cm
-    "soil_ph": (5.0, 7.5),          # pH
+# Rangos intermedios (Modo Advertencia para probar sensibilidad del ML)
+RANGES_ADVERTENCIA = {
+    "dht_temp": (32, 39),       # Temperatura al límite superior
+    "dht_humidity": (32, 40),   # Humedad ambiente comenzando a bajar
+    "soil_N": (5, 10),             # Nutrientes en declive
+    "soil_P": (5, 10),
+    "soil_K": (5, 10),
+    "soil_humidity": (15, 20),  # Suelo secándose moderadamente
+    "soil_temp": (36, 38),      # Suelo calentándose
+    "soil_ec": (400, 600),          # Salinidad subiendo a niveles de precaución
+    "soil_ph": (4, 5),          # pH acidificándose levemente
+    "battery": (21.0, 100.0),       
+    "piramometro_rad": (1001.0, 1199.0) # Radiación alta pero no extrema
+}
 
-    # Batería
-    "battery": (55.0, 100.0),       # %
+# Rangos anómalos (Modo Crítico para probar anomalías severas)
+RANGES_CRITICO = {
+    "dht_temp": (40.0, 45.0),       
+    "dht_humidity": (15.0, 32),   
+    "soil_N": (0, 5),              
+    "soil_P": (0, 5),
+    "soil_K": (0, 5),
+    "soil_humidity": (5.0, 10.0),  
+    "soil_temp": (39.0, 45.0),      
+    "soil_ec": (700, 1000),        
+    "soil_ph": (3, 4),          
+    "battery": (1.0, 100.0),       
+    "piramometro_rad": (1200.0, 1400.0) 
 }
 
 
 # ============================================================
 # ESTADO DE CADA NODO SIMULADO
 # ============================================================
-
 node_state = {}
 state_lock = threading.Lock()
-
-# Configuración recibida desde AgroTech.
-# Se conserva por separado para poder ver en el CMD qué horario
-# tiene aplicado cada nodo simulado.
 received_config = {}
 config_lock = threading.Lock()
 
@@ -164,14 +127,11 @@ for node_id in SIMULATED_NODES:
         "ultima_configuracion": None,
     }
 
-
 def crear_estado_nodo(nodo_id):
-    """Crea valores iniciales realistas para un nodo."""
     return {
-        "battery": random.uniform(*RANGES["battery"]),
+        "battery": random.uniform(*RANGES_SANA["battery"]),
         "cycle": 0,
     }
-
 
 for node_id in SIMULATED_NODES:
     node_state[node_id] = crear_estado_nodo(node_id)
@@ -180,578 +140,289 @@ for node_id in SIMULATED_NODES:
 # ============================================================
 # GENERACIÓN DE DATOS
 # ============================================================
-
 def clamp(value, minimum, maximum):
     return max(minimum, min(value, maximum))
 
-
 def generar_datos(nodo_id):
-    """
-    Genera exactamente la estructura principal que consume
-    el callback MQTT de AgroTech:
-        dht
-        suelo
-        bateria
-    """
+    """Genera datos según el modo actual de simulación."""
+    global sim_mode, sim_pira
+    
+    # Seleccionar el diccionario de rangos correcto según el estado
+    if sim_mode == "sana":
+        ranges_current = RANGES_SANA
+    elif sim_mode == "advertencia":
+        ranges_current = RANGES_ADVERTENCIA
+    else:
+        ranges_current = RANGES_CRITICO
 
-    # Pequeña evolución de batería para que las lecturas no sean
-    # completamente independientes entre sí.
     with state_lock:
         state = node_state[nodo_id]
         state["cycle"] += 1
-
-        # El nodo va consumiendo batería lentamente.
         state["battery"] -= random.uniform(0.0, 0.12)
-
-        # Recarga simulada ocasionalmente.
         if state["battery"] < 20:
             state["battery"] += random.uniform(0.5, 2.0)
 
         state["battery"] = clamp(
             state["battery"],
-            RANGES["battery"][0],
-            RANGES["battery"][1]
+            RANGES_SANA["battery"][0],
+            RANGES_SANA["battery"][1]
         )
-
         battery = round(state["battery"], 1)
 
     data = {
         "dht": {
-            "t": round(random.uniform(*RANGES["dht_temp"]), 1),
-            "h": round(random.uniform(*RANGES["dht_humidity"]), 1),
+            "t": round(random.uniform(*ranges_current["dht_temp"]), 1),
+            "h": round(random.uniform(*ranges_current["dht_humidity"]), 1),
         },
         "suelo": {
-            "N": random.randint(*RANGES["soil_N"]),
-            "P": random.randint(*RANGES["soil_P"]),
-            "K": random.randint(*RANGES["soil_K"]),
-            "hum": round(random.uniform(*RANGES["soil_humidity"]), 1),
-            "temp": round(random.uniform(*RANGES["soil_temp"]), 1),
-            "ec": random.randint(*RANGES["soil_ec"]),
-            "ph": round(random.uniform(*RANGES["soil_ph"]), 2),
+            "N": random.randint(*ranges_current["soil_N"]),
+            "P": random.randint(*ranges_current["soil_P"]),
+            "K": random.randint(*ranges_current["soil_K"]),
+            "hum": round(random.uniform(*ranges_current["soil_humidity"]), 1),
+            "temp": round(random.uniform(*ranges_current["soil_temp"]), 1),
+            "ec": random.randint(*ranges_current["soil_ec"]),
+            "ph": round(random.uniform(*ranges_current["soil_ph"]), 2),
         },
         "bateria": {
             "porcentaje": battery,
         },
     }
 
+    # Condicional de hardware: Simula si el nodo tiene o no conectado el Piramómetro
+    if sim_pira:
+        data["piramometro"] = {
+            "rad": round(random.uniform(*ranges_current["piramometro_rad"]), 1)
+        }
+
     return data
 
 
 # ============================================================
-# MQTT
+# MQTT Y LÓGICA DE CONFIRMACIÓN
 # ============================================================
-
 mqtt_client = None
 mqtt_connected = threading.Event()
 
-
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    """
-    El simulador también escucha esp32/config para poder observar
-    cuándo la aplicación envía una nueva configuración de horarios.
-    """
     if reason_code == 0:
         mqtt_connected.set()
         print(f"[MQTT] Conectado a {MQTT_BROKER}:{MQTT_PORT}")
-
         client.subscribe("esp32/config")
-        print("[MQTT] Suscrito a esp32/config (broadcast, formato antiguo)")
-
         client.subscribe("esp32/+/config")
-        print("[MQTT] Suscrito a esp32/+/config (por nodo, formato v12/v13)")
-
     else:
         mqtt_connected.clear()
         print(f"[MQTT] Error de conexión. reason_code={reason_code}")
-
 
 def on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
     mqtt_connected.clear()
     print(f"[MQTT] Desconectado. reason_code={reason_code}")
 
-
 def _reconstruir_horarios_config(config):
-    """
-    Reconstruye los horarios HH:MM usando el JSON que actualmente
-    envía AgroTech:
-
-        {
-            "horas": [10, 18],
-            "minutos": [30, 0]
-        }
-
-    También acepta el formato antiguo donde solo existía "horas".
-    """
     horas = config.get("horas")
     minutos = config.get("minutos")
-
     if not isinstance(horas, list):
         raise ValueError("El campo 'horas' no es una lista.")
-
-    # Formato nuevo: ambas listas deben corresponder posición a posición.
     if isinstance(minutos, list):
         if len(horas) != len(minutos):
-            raise ValueError(
-                f"'horas' tiene {len(horas)} elementos y "
-                f"'minutos' tiene {len(minutos)}."
-            )
-
+            raise ValueError(f"'horas' tiene {len(horas)} elementos y 'minutos' tiene {len(minutos)}.")
         horarios = []
         for h, m in zip(horas, minutos):
-            h = int(h)
-            m = int(m)
-
-            if not (0 <= h <= 23):
-                raise ValueError(f"Hora fuera de rango: {h}")
-            if not (0 <= m <= 59):
-                raise ValueError(f"Minuto fuera de rango: {m}")
-
+            h, m = int(h), int(m)
+            if not (0 <= h <= 23) or not (0 <= m <= 59):
+                raise ValueError("Hora/Minuto fuera de rango.")
             horarios.append(f"{h:02d}:{m:02d}")
-
         return horarios
-
-    # Compatibilidad con el formato anterior: horas enteras => HH:00.
     horarios = []
     for h in horas:
         h = int(h)
         if not (0 <= h <= 23):
-            raise ValueError(f"Hora fuera de rango: {h}")
+            raise ValueError("Hora fuera de rango.")
         horarios.append(f"{h:02d}:00")
-
     return horarios
 
-
 def enviar_confirmacion_horario(nodo_id, horarios):
-    """
-    Publica el ACK de horario en esp32/<nodo_id>/configok, tal como lo
-    espera AgroTech (ver estado_config_ack / _esperar_confirmacion en la
-    app). Se ejecuta en un hilo aparte para no bloquear el loop de MQTT
-    y para poder simular el retraso real de un ESP32 despertando.
-    """
-    if not CONFIRM_HORARIOS:
-        return
-
-    if random.random() > CONFIRM_PROBABILITY:
-        print(
-            f"[ESP32] {nodo_id}: configurado para NO confirmar esta vez "
-            f"(simulando nodo dormido/no disponible)."
-        )
-        return
-
+    if not CONFIRM_HORARIOS: return
+    if random.random() > CONFIRM_PROBABILITY: return
     espera = random.uniform(*CONFIRM_DELAY_SECONDS)
     time.sleep(espera)
-
-    if not mqtt_connected.is_set():
-        print(f"[ESP32] {nodo_id}: sin conexión; no se pudo confirmar horario")
-        return
-
+    if not mqtt_connected.is_set(): return
     topic = f"esp32/{nodo_id}/configok"
-    payload = json.dumps({
-        "ok": True,
-        "nodo": nodo_id,
-        "horarios": horarios,
-    }, separators=(",", ":"))
-
+    payload = json.dumps({"ok": True, "nodo": nodo_id, "horarios": horarios}, separators=(",", ":"))
     info = mqtt_client.publish(topic, payload, qos=1, retain=False)
     info.wait_for_publish(timeout=5)
 
-    if info.is_published():
-        print(
-            f"[ESP32] {nodo_id} -> {topic} | ACK enviado tras "
-            f"{espera:.1f}s | {payload}"
-        )
-    else:
-        print(f"[ESP32] {nodo_id}: error publicando ACK en {topic}")
-
-
 def _aplicar_configuracion(nodos_afectados, horarios, origen_topic):
-    """
-    Actualiza received_config para los nodos afectados y dispara, en
-    segundo plano, la confirmación de horario (esp32/<nodo>/configok)
-    para cada uno de ellos.
-    """
     ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     with config_lock:
         for node_id in nodos_afectados:
-            received_config[node_id] = {
-                "horarios": horarios.copy(),
-                "ultima_configuracion": ahora,
-            }
-
-    print("[ESP32] Configuración JSON válida.")
-    print("[ESP32] Horarios reconstruidos: " + ", ".join(horarios))
-    print(
-        "[ESP32] Configuración aplicada a: "
-        + ", ".join(nodos_afectados)
-        + f" (origen: {origen_topic})"
-    )
-    print(f"[ESP32] Hora de recepción: {ahora}")
-
+            received_config[node_id] = {"horarios": horarios.copy(), "ultima_configuracion": ahora}
+    print(f"\n[ESP32] Configuración JSON válida. Horarios: {', '.join(horarios)}")
     for node_id in nodos_afectados:
-        threading.Thread(
-            target=enviar_confirmacion_horario,
-            args=(node_id, horarios.copy()),
-            daemon=True,
-            name=f"ACK-{node_id}"
-        ).start()
-
+        threading.Thread(target=enviar_confirmacion_horario, args=(node_id, horarios.copy()), daemon=True).start()
 
 def on_message(client, userdata, msg):
-    """
-    Emula la recepción que tendría un ESP32 cuando AgroTech publica
-    una nueva configuración por MQTT, y responde con la confirmación
-    de horario que la app espera.
-
-    AgroTech (v12/v13) publica el JSON en:
-        esp32/<nodo_id>/config     (formato actual, por nodo, retenido)
-
-    y por compatibilidad este simulador también acepta el formato
-    antiguo, global:
-        esp32/config
-
-    En ambos casos el JSON contiene las listas paralelas 'horas' y
-    'minutos'. Tras aplicar la configuración, el simulador publica el
-    ACK en esp32/<nodo_id>/configok para cada nodo afectado.
-    """
-    print()
-    print("=" * 70)
-    print("[ESP32] MENSAJE RECIBIDO DESDE AGROTECH")
-    print("=" * 70)
-    print(f"[ESP32] Topic   : {msg.topic}")
-
     try:
         payload = msg.payload.decode("utf-8")
-    except UnicodeDecodeError:
-        print("[ESP32] Error: el mensaje no contiene UTF-8 válido.")
-        print("=" * 70)
-        return
-
-    print(f"[ESP32] JSON    : {payload}")
-
-    # Determinar si es el tópico global (esp32/config) o el tópico por
-    # nodo (esp32/<nodo_id>/config).
+    except UnicodeDecodeError: return
     partes = msg.topic.split("/")
-
     if msg.topic == "esp32/config":
         nodos_afectados = list(SIMULATED_NODES)
     elif len(partes) == 3 and partes[0] == "esp32" and partes[2] == "config":
         nodo_id = partes[1]
-        if nodo_id not in SIMULATED_NODES:
-            print(
-                f"[ESP32] Aviso: '{nodo_id}' no está en SIMULATED_NODES; "
-                f"se ignora el mensaje."
-            )
-            print("=" * 70)
-            return
+        if nodo_id not in SIMULATED_NODES: return
         nodos_afectados = [nodo_id]
-    else:
-        print(f"[ESP32] Aviso: tópico no reconocido para config: {msg.topic}")
-        print("=" * 70)
-        return
-
+    else: return
     try:
         config = json.loads(payload)
-
-        if not isinstance(config, dict):
-            raise ValueError("El JSON recibido no es un objeto.")
-
         horarios = _reconstruir_horarios_config(config)
-
         _aplicar_configuracion(nodos_afectados, horarios, msg.topic)
-
-    except json.JSONDecodeError as exc:
-        print(f"[ESP32] Error: JSON inválido: {exc}")
-    except (TypeError, ValueError) as exc:
-        print(f"[ESP32] Error procesando configuración: {exc}")
-    except Exception as exc:
-        print(f"[ESP32] Error inesperado procesando configuración: {exc}")
-
-    print("=" * 70)
-
+    except Exception as exc: pass
 
 def iniciar_mqtt():
     global mqtt_client
-
-    mqtt_client = mqtt.Client(
-        mqtt.CallbackAPIVersion.VERSION2,
-        client_id="agrotech_simulador"
-    )
-
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="agrotech_simulador")
     mqtt_client.on_connect = on_connect
     mqtt_client.on_disconnect = on_disconnect
     mqtt_client.on_message = on_message
-
-    print(f"[MQTT] Conectando a {MQTT_BROKER}:{MQTT_PORT}...")
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     mqtt_client.loop_start()
 
-
 def publicar_sensor(nodo_id):
-    """Publica una lectura del nodo por su topic correspondiente."""
     topic = f"esp32/{nodo_id}/data"
     data = generar_datos(nodo_id)
     payload = json.dumps(data, separators=(",", ":"))
 
-    if not mqtt_connected.is_set():
-        print(f"[MQTT] {nodo_id}: sin conexión; lectura no enviada")
-        return
-
+    if not mqtt_connected.is_set(): return
     info = mqtt_client.publish(topic, payload, qos=0, retain=False)
-
+    
+    # Formateo dinámico del piramómetro para impresión en consola
+    pira_str = f"Rad={data['piramometro']['rad']}W/m²" if "piramometro" in data else "Rad=---"
+    
     if info.rc == mqtt.MQTT_ERR_SUCCESS:
-        print(
-            f"[MQTT] {nodo_id} -> {topic} | "
-            f"T={data['dht']['t']}°C "
-            f"H={data['dht']['h']}% | "
-            f"NPK={data['suelo']['N']}/"
-            f"{data['suelo']['P']}/"
-            f"{data['suelo']['K']} | "
-            f"Suelo={data['suelo']['hum']}% | "
-            f"pH={data['suelo']['ph']} | "
-            f"Bat={data['bateria']['porcentaje']}%"
-        )
-    else:
-        print(f"[MQTT] Error publicando {nodo_id}: rc={info.rc}")
+        print(f"[MQTT] {nodo_id} | T={data['dht']['t']}°C H={data['dht']['h']}% | "
+              f"NPK={data['suelo']['N']}/{data['suelo']['P']}/{data['suelo']['K']} | "
+              f"HumS={data['suelo']['hum']}% pH={data['suelo']['ph']} | "
+              f"Bat={data['bateria']['porcentaje']}% | {pira_str}")
 
 
 # ============================================================
-# IMÁGENES
+# IMÁGENES HTTP
 # ============================================================
-
 def obtener_imagenes():
-    """Devuelve las imágenes disponibles en IMAGE_DIR."""
-    if not os.path.isdir(IMAGE_DIR):
-        raise FileNotFoundError(
-            f"La carpeta de imágenes no existe:\n{IMAGE_DIR}"
-        )
-
-    archivos = []
-
-    for nombre in os.listdir(IMAGE_DIR):
-        ruta = os.path.join(IMAGE_DIR, nombre)
-
-        if not os.path.isfile(ruta):
-            continue
-
-        extension = os.path.splitext(nombre)[1].lower()
-
-        if extension in IMAGE_EXTENSIONS:
-            archivos.append(ruta)
-
-    return archivos
-
-
-def seleccionar_imagen_aleatoria():
-    imagenes = obtener_imagenes()
-
-    if not imagenes:
-        raise FileNotFoundError(
-            f"No se encontraron imágenes compatibles en:\n{IMAGE_DIR}"
-        )
-
-    return random.choice(imagenes)
-
+    if not os.path.isdir(IMAGE_DIR): return []
+    return [os.path.join(IMAGE_DIR, n) for n in os.listdir(IMAGE_DIR) 
+            if os.path.isfile(os.path.join(IMAGE_DIR, n)) and os.path.splitext(n)[1].lower() in IMAGE_EXTENSIONS]
 
 def enviar_imagen_http(nodo_id):
-    """
-    Emula el POST binario que espera _PhotoUploadHandler.
-
-    La aplicación espera:
-        POST /upload?nodo=nodo1
-
-    con los bytes JPEG/PNG/etc. directamente en el body.
-    """
-
     try:
-        ruta_imagen = seleccionar_imagen_aleatoria()
-
-        with open(ruta_imagen, "rb") as f:
-            imagen_bytes = f.read()
+        imagenes = obtener_imagenes()
+        if not imagenes: return
+        ruta_imagen = random.choice(imagenes)
+        with open(ruta_imagen, "rb") as f: imagen_bytes = f.read()
 
         query = urllib.parse.urlencode({"nodo": nodo_id})
-        url = (
-            f"http://{HTTP_SERVER_HOST}:{HTTP_PHOTO_PORT}"
-            f"{HTTP_PHOTO_PATH}?{query}"
-        )
-
-        extension = os.path.splitext(ruta_imagen)[1].lower()
+        url = f"http://{HTTP_SERVER_HOST}:{HTTP_PHOTO_PORT}{HTTP_PHOTO_PATH}?{query}"
         content_type = mimetypes.guess_type(ruta_imagen)[0] or "image/jpeg"
 
-        request = urllib.request.Request(
-            url=url,
-            data=imagen_bytes,
-            method="POST",
-            headers={
-                "Content-Type": content_type,
-                "Content-Length": str(len(imagen_bytes)),
-            },
-        )
-
-        inicio = time.perf_counter()
-
-        with urllib.request.urlopen(request, timeout=15) as response:
-            respuesta = response.read().decode(
-                "utf-8", errors="replace"
-            )
-            status = response.status
-
-        tiempo_ms = (time.perf_counter() - inicio) * 1000
-
-        print(
-            f"[HTTP] {nodo_id} -> {url} | "
-            f"{os.path.basename(ruta_imagen)} | "
-            f"{len(imagen_bytes) / 1024:.1f} KB | "
-            f"HTTP {status} | {tiempo_ms:.0f} ms | "
-            f"respuesta={respuesta!r}"
-        )
-
-    except Exception as exc:
-        print(f"[HTTP] Error enviando foto de {nodo_id}: {exc}")
+        request = urllib.request.Request(url=url, data=imagen_bytes, method="POST",
+                                         headers={"Content-Type": content_type, "Content-Length": str(len(imagen_bytes))})
+        with urllib.request.urlopen(request, timeout=15) as response: pass
+    except Exception as exc: pass
 
 
 # ============================================================
 # HILOS DE SIMULACIÓN
 # ============================================================
-
 def hilo_sensores(nodo_id):
-    """Publica datos MQTT periódicamente."""
-    print(
-        f"[SIM] Iniciando sensores de {nodo_id} "
-        f"cada {SENSOR_INTERVAL_SECONDS}s"
-    )
-
     while True:
-        try:
-            publicar_sensor(nodo_id)
-        except Exception as exc:
-            print(f"[SIM] Error en sensores de {nodo_id}: {exc}")
-
+        try: publicar_sensor(nodo_id)
+        except Exception as exc: print(f"[SIM] Error en sensores de {nodo_id}: {exc}")
         time.sleep(SENSOR_INTERVAL_SECONDS)
 
-
 def hilo_camara(nodo_id):
-    """Envía fotografías HTTP periódicamente."""
-    print(
-        f"[SIM] Iniciando cámara de {nodo_id} "
-        f"cada {PHOTO_INTERVAL_SECONDS}s"
-    )
-
-    if SEND_PHOTO_ON_START:
-        enviar_imagen_http(nodo_id)
-
+    if SEND_PHOTO_ON_START: enviar_imagen_http(nodo_id)
     while True:
         time.sleep(PHOTO_INTERVAL_SECONDS)
-
-        try:
-            enviar_imagen_http(nodo_id)
-        except Exception as exc:
-            print(f"[SIM] Error en cámara de {nodo_id}: {exc}")
+        try: enviar_imagen_http(nodo_id)
+        except Exception: pass
 
 
 # ============================================================
-# COMPROBACIONES
+# MAIN Y CONSOLA INTERACTIVA (CLI)
 # ============================================================
-
-def comprobar_configuracion():
-    print("=" * 70)
-    print("AGROTECH - SIMULADOR DE ESP32")
-    print("=" * 70)
-
-    print(f"Broker MQTT : {MQTT_BROKER}:{MQTT_PORT}")
-    print(
-        f"Servidor HTTP: "
-        f"http://{HTTP_SERVER_HOST}:{HTTP_PHOTO_PORT}{HTTP_PHOTO_PATH}"
-    )
-    print(f"Carpeta imágenes: {IMAGE_DIR}")
-    print(f"Nodos simulados: {', '.join(SIMULATED_NODES)}")
-    print(f"Intervalo MQTT: {SENSOR_INTERVAL_SECONDS}s")
-    print(f"Intervalo HTTP: {PHOTO_INTERVAL_SECONDS}s")
-    print("Recepción MQTT: esp32/config (global) y esp32/<nodo>/config (por nodo)")
-    print('Formato esperado: {"horas":[...],"minutos":[...]}')
-    if CONFIRM_HORARIOS:
-        print(
-            f"Confirmación   : esp32/<nodo>/configok "
-            f"(retraso {CONFIRM_DELAY_SECONDS[0]:.0f}-{CONFIRM_DELAY_SECONDS[1]:.0f}s, "
-            f"probabilidad {CONFIRM_PROBABILITY:.0%})"
-        )
-    else:
-        print("Confirmación   : DESACTIVADA (CONFIRM_HORARIOS = False)")
-    print()
-
-    if not os.path.isdir(IMAGE_DIR):
-        print("[AVISO] La carpeta de imágenes todavía no existe.")
-
-    else:
-        try:
-            imagenes = obtener_imagenes()
-            print(f"[IMG] Imágenes encontradas: {len(imagenes)}")
-        except Exception as exc:
-            print(f"[IMG] {exc}")
-
-    print("=" * 70)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
-    comprobar_configuracion()
+    global sim_mode, sim_pira
 
-    if not SIMULATED_NODES:
-        raise RuntimeError(
-            "SIMULATED_NODES está vacío. Añade al menos un nodo."
-        )
+    print("=" * 70)
+    print("AGROTECH - SIMULADOR INTERACTIVO ESP32 + ML TESTING")
+    print("=" * 70)
+    print(f"Broker MQTT : {MQTT_BROKER}:{MQTT_PORT}")
+    print(f"Nodos simulados: {', '.join(SIMULATED_NODES)}")
+    print(f"Intervalo MQTT: {SENSOR_INTERVAL_SECONDS}s | Intervalo HTTP: {PHOTO_INTERVAL_SECONDS}s")
+    print("=" * 70)
+    print("COMANDOS DISPONIBLES EN CONSOLA:")
+    print("  sana        -> Entorno en parámetros normales.")
+    print("  advertencia -> Desviaciones leves (Prueba de sensibilidad ML).")
+    print("  critico     -> Anomalías severas (Prueba de alertas graves ML).")
+    print("  pira on     -> Habilita el piramómetro.")
+    print("  pira off    -> Inhabilita el piramómetro.")
+    print("  estado      -> Muestra la configuración actual de la simulación.")
+    print("  salir       -> Detener el simulador.")
+    print("=" * 70)
 
+    if not SIMULATED_NODES: return
     iniciar_mqtt()
 
     hilos = []
-
     for nodo_id in SIMULATED_NODES:
-        if nodo_id not in node_state:
-            node_state[nodo_id] = crear_estado_nodo(nodo_id)
-
-        hilo = threading.Thread(
-            target=hilo_sensores,
-            args=(nodo_id,),
-            daemon=True,
-            name=f"MQTT-{nodo_id}"
-        )
+        hilo = threading.Thread(target=hilo_sensores, args=(nodo_id,), daemon=True)
         hilo.start()
         hilos.append(hilo)
 
-        hilo = threading.Thread(
-            target=hilo_camara,
-            args=(nodo_id,),
-            daemon=True,
-            name=f"HTTP-CAM-{nodo_id}"
-        )
+        hilo = threading.Thread(target=hilo_camara, args=(nodo_id,), daemon=True)
         hilo.start()
         hilos.append(hilo)
 
-    print()
-    print("[SIM] Simulación activa.")
-    print("[SIM] Pulsa Ctrl+C para detenerla.")
-    print()
+    print("\n[SIM] Simulación activa. Escribe un comando y presiona Enter...\n")
 
+    # Bucle de comandos interactivo
     try:
         while True:
-            time.sleep(1)
-
+            cmd = input().strip().lower()
+            if cmd == 'sana':
+                sim_mode = 'sana'
+                print("\n⚙️  [CLI] MODO CAMBIADO: 🌱 PLANTA SANA (Parámetros Normales)")
+            elif cmd == 'advertencia':
+                sim_mode = 'advertencia'
+                print("\n⚙️  [CLI] MODO CAMBIADO: ⚠️ ADVERTENCIA (Desviaciones Leves Activadas)")
+            elif cmd == 'critico':
+                sim_mode = 'critico'
+                print("\n⚙️  [CLI] MODO CAMBIADO: 🚨 CRÍTICO (Anomalías Severas Activadas)")
+            elif cmd == 'pira on':
+                sim_pira = True
+                print("\n⚙️  [CLI] HARDWARE: ☀️ Piramómetro ACTIVADO")
+            elif cmd == 'pira off':
+                sim_pira = False
+                print("\n⚙️  [CLI] HARDWARE: ❌ Piramómetro DESACTIVADO (Excluido de los datos)")
+            elif cmd == 'estado':
+                print(f"\n📊 [CLI] ESTADO ACTUAL -> Modo: {sim_mode.upper()} | Piramómetro: {'ON' if sim_pira else 'OFF'}")
+            elif cmd in ['salir', 'quit', 'exit']:
+                print("\n[SIM] Deteniendo simulador...")
+                break
+            elif cmd == '':
+                pass
+            else:
+                print(f"[CLI] Comando desconocido: '{cmd}'. Usa: sana, advertencia, critico, pira on, pira off, estado, salir") 
+                
     except KeyboardInterrupt:
-        print("\n[SIM] Deteniendo simulador...")
-
+        print("\n[SIM] Interrupción manual. Deteniendo simulador...")
     finally:
         if mqtt_client is not None:
             try:
                 mqtt_client.loop_stop()
                 mqtt_client.disconnect()
-            except Exception:
-                pass
-
+            except Exception: pass
         print("[SIM] Simulador detenido.")
-
 
 if __name__ == "__main__":
     main()
