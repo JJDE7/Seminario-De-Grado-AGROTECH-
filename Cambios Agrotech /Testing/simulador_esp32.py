@@ -81,15 +81,13 @@ IMAGE_DIR = r"C:\Users\Usuario\Desktop\Wallpapers"
 SIMULATED_NODES = [
     "nodo1",
     "nodo2",
-    "nodo3",
-    "nodo4",
 ]
 
 # Cada cuánto se genera y publica una lectura MQTT.
-SENSOR_INTERVAL_SECONDS = 10
+SENSOR_INTERVAL_SECONDS = 15
 
 # Cada cuánto se envía una fotografía HTTP.
-PHOTO_INTERVAL_SECONDS = 30
+PHOTO_INTERVAL_SECONDS = 15
 
 # True: una fotografía se envía inmediatamente al arrancar.
 SEND_PHOTO_ON_START = True
@@ -98,6 +96,27 @@ SEND_PHOTO_ON_START = True
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".bmp", ".webp"
 }
+
+
+# ============================================================
+# CONFIRMACIÓN DE HORARIOS (esp32/<nodo>/configok)
+# ============================================================
+#
+# AgroTech (v12/v13) publica la config en esp32/<nodo_id>/config y luego
+# espera, durante unos segundos, una respuesta en esp32/<nodo_id>/configok
+# para saber que el nodo realmente guardó el horario. Si no llega nada,
+# la app asume que el nodo está dormido.
+
+# True: el simulador responde automáticamente a cada configuración recibida.
+CONFIRM_HORARIOS = True
+
+# Rango de espera (segundos) antes de responder, para imitar el tiempo
+# real que tarda un ESP32 en despertar/procesar y publicar su ACK.
+CONFIRM_DELAY_SECONDS = (1.0, 3.0)
+
+# Probabilidad (0.0 a 1.0) de que el nodo realmente confirme. Bájala para
+# simular nodos dormidos/desconectados que no responden a tiempo.
+CONFIRM_PROBABILITY = 1.0
 
 
 # ============================================================
@@ -236,7 +255,10 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
         print(f"[MQTT] Conectado a {MQTT_BROKER}:{MQTT_PORT}")
 
         client.subscribe("esp32/config")
-        print("[MQTT] Suscrito a esp32/config")
+        print("[MQTT] Suscrito a esp32/config (broadcast, formato antiguo)")
+
+        client.subscribe("esp32/+/config")
+        print("[MQTT] Suscrito a esp32/+/config (por nodo, formato v12/v13)")
 
     else:
         mqtt_connected.clear()
@@ -299,15 +321,98 @@ def _reconstruir_horarios_config(config):
     return horarios
 
 
+def enviar_confirmacion_horario(nodo_id, horarios):
+    """
+    Publica el ACK de horario en esp32/<nodo_id>/configok, tal como lo
+    espera AgroTech (ver estado_config_ack / _esperar_confirmacion en la
+    app). Se ejecuta en un hilo aparte para no bloquear el loop de MQTT
+    y para poder simular el retraso real de un ESP32 despertando.
+    """
+    if not CONFIRM_HORARIOS:
+        return
+
+    if random.random() > CONFIRM_PROBABILITY:
+        print(
+            f"[ESP32] {nodo_id}: configurado para NO confirmar esta vez "
+            f"(simulando nodo dormido/no disponible)."
+        )
+        return
+
+    espera = random.uniform(*CONFIRM_DELAY_SECONDS)
+    time.sleep(espera)
+
+    if not mqtt_connected.is_set():
+        print(f"[ESP32] {nodo_id}: sin conexión; no se pudo confirmar horario")
+        return
+
+    topic = f"esp32/{nodo_id}/configok"
+    payload = json.dumps({
+        "ok": True,
+        "nodo": nodo_id,
+        "horarios": horarios,
+    }, separators=(",", ":"))
+
+    info = mqtt_client.publish(topic, payload, qos=1, retain=False)
+    info.wait_for_publish(timeout=5)
+
+    if info.is_published():
+        print(
+            f"[ESP32] {nodo_id} -> {topic} | ACK enviado tras "
+            f"{espera:.1f}s | {payload}"
+        )
+    else:
+        print(f"[ESP32] {nodo_id}: error publicando ACK en {topic}")
+
+
+def _aplicar_configuracion(nodos_afectados, horarios, origen_topic):
+    """
+    Actualiza received_config para los nodos afectados y dispara, en
+    segundo plano, la confirmación de horario (esp32/<nodo>/configok)
+    para cada uno de ellos.
+    """
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with config_lock:
+        for node_id in nodos_afectados:
+            received_config[node_id] = {
+                "horarios": horarios.copy(),
+                "ultima_configuracion": ahora,
+            }
+
+    print("[ESP32] Configuración JSON válida.")
+    print("[ESP32] Horarios reconstruidos: " + ", ".join(horarios))
+    print(
+        "[ESP32] Configuración aplicada a: "
+        + ", ".join(nodos_afectados)
+        + f" (origen: {origen_topic})"
+    )
+    print(f"[ESP32] Hora de recepción: {ahora}")
+
+    for node_id in nodos_afectados:
+        threading.Thread(
+            target=enviar_confirmacion_horario,
+            args=(node_id, horarios.copy()),
+            daemon=True,
+            name=f"ACK-{node_id}"
+        ).start()
+
+
 def on_message(client, userdata, msg):
     """
     Emula la recepción que tendría un ESP32 cuando AgroTech publica
-    una nueva configuración por MQTT.
+    una nueva configuración por MQTT, y responde con la confirmación
+    de horario que la app espera.
 
-    AgroTech publica actualmente el JSON en:
+    AgroTech (v12/v13) publica el JSON en:
+        esp32/<nodo_id>/config     (formato actual, por nodo, retenido)
+
+    y por compatibilidad este simulador también acepta el formato
+    antiguo, global:
         esp32/config
 
-    El JSON contiene las listas paralelas 'horas' y 'minutos'.
+    En ambos casos el JSON contiene las listas paralelas 'horas' y
+    'minutos'. Tras aplicar la configuración, el simulador publica el
+    ACK en esp32/<nodo_id>/configok para cada nodo afectado.
     """
     print()
     print("=" * 70)
@@ -324,6 +429,27 @@ def on_message(client, userdata, msg):
 
     print(f"[ESP32] JSON    : {payload}")
 
+    # Determinar si es el tópico global (esp32/config) o el tópico por
+    # nodo (esp32/<nodo_id>/config).
+    partes = msg.topic.split("/")
+
+    if msg.topic == "esp32/config":
+        nodos_afectados = list(SIMULATED_NODES)
+    elif len(partes) == 3 and partes[0] == "esp32" and partes[2] == "config":
+        nodo_id = partes[1]
+        if nodo_id not in SIMULATED_NODES:
+            print(
+                f"[ESP32] Aviso: '{nodo_id}' no está en SIMULATED_NODES; "
+                f"se ignora el mensaje."
+            )
+            print("=" * 70)
+            return
+        nodos_afectados = [nodo_id]
+    else:
+        print(f"[ESP32] Aviso: tópico no reconocido para config: {msg.topic}")
+        print("=" * 70)
+        return
+
     try:
         config = json.loads(payload)
 
@@ -332,28 +458,7 @@ def on_message(client, userdata, msg):
 
         horarios = _reconstruir_horarios_config(config)
 
-        # AgroTech no incluye nodo_id en este JSON; el topic también es
-        # global (esp32/config). Por ello, en este simulador la orden se
-        # considera un broadcast y se aplica a todos los nodos simulados.
-        ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        with config_lock:
-            for node_id in SIMULATED_NODES:
-                received_config[node_id] = {
-                    "horarios": horarios.copy(),
-                    "ultima_configuracion": ahora,
-                }
-
-        print("[ESP32] Configuración JSON válida.")
-        print(
-            "[ESP32] Horarios reconstruidos: "
-            + ", ".join(horarios)
-        )
-        print(
-            "[ESP32] Configuración aplicada a los nodos simulados: "
-            + ", ".join(SIMULATED_NODES)
-        )
-        print(f"[ESP32] Hora de recepción: {ahora}")
+        _aplicar_configuracion(nodos_afectados, horarios, msg.topic)
 
     except json.JSONDecodeError as exc:
         print(f"[ESP32] Error: JSON inválido: {exc}")
@@ -562,8 +667,16 @@ def comprobar_configuracion():
     print(f"Nodos simulados: {', '.join(SIMULATED_NODES)}")
     print(f"Intervalo MQTT: {SENSOR_INTERVAL_SECONDS}s")
     print(f"Intervalo HTTP: {PHOTO_INTERVAL_SECONDS}s")
-    print("Recepción MQTT: esp32/config")
+    print("Recepción MQTT: esp32/config (global) y esp32/<nodo>/config (por nodo)")
     print('Formato esperado: {"horas":[...],"minutos":[...]}')
+    if CONFIRM_HORARIOS:
+        print(
+            f"Confirmación   : esp32/<nodo>/configok "
+            f"(retraso {CONFIRM_DELAY_SECONDS[0]:.0f}-{CONFIRM_DELAY_SECONDS[1]:.0f}s, "
+            f"probabilidad {CONFIRM_PROBABILITY:.0%})"
+        )
+    else:
+        print("Confirmación   : DESACTIVADA (CONFIRM_HORARIOS = False)")
     print()
 
     if not os.path.isdir(IMAGE_DIR):
