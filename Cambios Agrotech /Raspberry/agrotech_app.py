@@ -1,11 +1,10 @@
 """
 AgroTech Dashboard + FastAPI — Compatible con Flet 0.84+
-v4.0.2 — Cambios principales:
-- Corrección de migración SQLite: Se elimina dinámicamente la columna 'payload' de BDs antiguas.
-- Algoritmo de ML (Isolation Forest) integrado para detección de anomalías (9 Dimensiones: incl. NPK).
-- Tabla 'alertas' añadida para registrar anomalías multivariables con severidad.
-- Sincronización del estado de alertas (Reconocida, Resuelta) desde la nube (API GET).
-- Campo 'payload' descartado; los JSON se reconstruyen al vuelo desde la BD.
+v4.1.0 — Cambios principales:
+- Clasificación de anomalías mediante Random Forest supervisado (13 Dimensiones).
+- Integración de variables temporales cíclicas (seno/coseno).
+- Descripción dinámica basada en reglas agronómicas (Tomate).
+- Sin alertas falsas: Solo envía eventos cuando se clasifica como anomalía.
 """
 
 import flet as ft
@@ -15,12 +14,14 @@ import sqlite3
 import threading
 import time       
 import base64   
+import math
 import urllib.request
 import requests
 import os
 import numpy as np
+import pandas as pd
 import joblib
-from sklearn.ensemble import IsolationForest
+import warnings
 from datetime import datetime
 from typing import Optional
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,7 +31,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 import uvicorn
+from sklearn.exceptions import InconsistentVersionWarning
 
+# Ignorar la advertencia de versión de scikit-learn para limpiar la consola
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
 # ══════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
@@ -60,7 +64,7 @@ DEFAULT_MAX_STORAGE_MB = 512
 DEFAULT_DELETE_COUNT = 100
 os.makedirs(DATA_DIR, exist_ok=True)
 
-MODELO_ML_PATH = os.path.join(DATA_DIR, "iforest_model.joblib")
+MODELO_ML_PATH = os.path.join(DATA_DIR, "rf_model.joblib")
 
 
 def cargar_config_almacenamiento():
@@ -176,7 +180,6 @@ def sqlite_iniciar():
     try:
         os.makedirs(os.path.dirname(SQLITE_DB), exist_ok=True)
         with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-            # 1. Crear tabla con la estructura limpia
             conn.execute("""CREATE TABLE IF NOT EXISTS mediciones (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, nodo_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL, temperatura REAL, humedad REAL,
@@ -184,7 +187,6 @@ def sqlite_iniciar():
                 temperatura_suelo REAL, conductividad REAL, ph REAL, bateria REAL,
                 radiacion REAL, enviado INTEGER NOT NULL DEFAULT 0)""")
             
-            # 1.5 Migración automática si la tabla antigua existe con 'payload'
             cols_med = {r[1] for r in conn.execute("PRAGMA table_info(mediciones)").fetchall()}
             if "payload" in cols_med:
                 print("[SQLITE] Migrando tabla 'mediciones' para eliminar la restricción de 'payload'...")
@@ -204,7 +206,6 @@ def sqlite_iniciar():
                 conn.execute("DROP TABLE mediciones_old")
                 print("[SQLITE] Migración de 'mediciones' completada.")
             
-            # 2. Nueva tabla de alertas ML
             conn.execute("""CREATE TABLE IF NOT EXISTS alertas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, 
                 nodo_id TEXT NOT NULL,
@@ -337,38 +338,11 @@ def guardar_sqlite(nodo_id, dato, timestamp):
         return None
 
 # ══════════════════════════════════════════════════════════════════════
-#  MACHINE LEARNING — ISOLATION FOREST
+#  MACHINE LEARNING — RANDOM FOREST
 # ══════════════════════════════════════════════════════════════════════
 
-#Entrenamiento comentado para mantener el modelo "congelado"
-'''
-def entrenar_modelo_iforest():
-    """Extrae datos históricos y entrena el modelo de detección de anomalías."""
-    try:
-        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-            # CORRECCIÓN DE SINTAXIS: Se agregó "NULL" al final de la consulta SQL
-            cursor = conn.execute("""
-                SELECT temperatura, humedad, humedad_suelo, temperatura_suelo, ph, conductividad, nitrogeno, fosforo, potasio
-                FROM mediciones 
-                WHERE temperatura IS NOT NULL AND humedad_suelo IS NOT NULL
-            """)
-            datos = cursor.fetchall()
-            
-        if len(datos) < 50:
-            print(f"[ML] Datos insuficientes para entrenar ({len(datos)}). Mínimo 50 registros sanos.")
-            return
-
-        X = np.array(datos)
-        modelo = IsolationForest(n_estimators=100, contamination=0.035, random_state=42)
-        modelo.fit(X)
-        joblib.dump(modelo, MODELO_ML_PATH)
-        print("[ML] Modelo Isolation Forest entrenado y guardado con éxito.")
-    except Exception as e:
-        print(f"[ML] Error entrenando modelo: {e}")
-'''
-
 def evaluar_anomalias(nodo_id, timestamp, registro):
-    """Evalúa la medición actual en busca de anomalías y genera alertas."""
+    """Evalúa la medición actual en busca de anomalías y genera alertas usando Random Forest."""
     if not os.path.exists(MODELO_ML_PATH):
         return
 
@@ -390,28 +364,76 @@ def evaluar_anomalias(nodo_id, timestamp, registro):
 
         if None in [t, h, hum_s, temp_s, ph, ec, n, p, k]:
             return 
+            
+        try:
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        except:
+            dt = datetime.now()
+            
+        hora_sin = math.sin(2 * math.pi * dt.hour / 24.0)
+        hora_cos = math.cos(2 * math.pi * dt.hour / 24.0)
+        mes_sin = math.sin(2 * math.pi * dt.month / 12.0)
+        mes_cos = math.cos(2 * math.pi * dt.month / 12.0)
 
-        vector = np.array([[t, h, hum_s, temp_s, ph, ec, n, p, k]])
+        # SOLUCIÓN 1: Usar un DataFrame de Pandas con los nombres exactos para evitar el UserWarning
+        nombres_caracteristicas = ['nitrogeno', 'fosforo', 'potasio', 'ph', 'conductividad', 'humedad_suelo', 'temperatura_suelo', 'temperatura', 'humedad', 'hora_sin', 'hora_cos', 'mes_sin', 'mes_cos']
+        vector = pd.DataFrame([[n, p, k, ph, ec, hum_s, temp_s, t, h, hora_sin, hora_cos, mes_sin, mes_cos]], columns=nombres_caracteristicas)
         
-        prediccion = modelo.predict(vector) 
-        score = float(modelo.decision_function(vector)[0]) 
+        prediccion = modelo.predict(vector)[0]
+        
+        if prediccion == 'Sin anomalías (Sana)':
+            return
 
-        if prediccion[0] == -1:
-            severidad = "Crítica" if score < -0.05 else "Advertencia"
-            descripcion = f"Patrón multivariable inusual detectado. Score: {score:.3f}. Revisar condiciones de suelo y ambiente."
+        try:
+            probabilidades = modelo.predict_proba(vector)[0]
+            confianza = float(max(probabilidades))
+        except AttributeError:
+            confianza = 0.99
             
-            with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
-                conn.execute("""
-                    INSERT INTO alertas (nodo_id, timestamp, tipo, puntuacion, severidad, descripcion, estado)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (nodo_id, timestamp, "Patrón Multivariable", score, severidad, descripcion, "Activa"))
-                conn.commit()
+        severidad = "Crítica" if confianza > 0.6 else "Advertencia"
+
+        # SOLUCIÓN 2: Sincronizar los rangos exactamente con el simulador
+        RANGES_SANA = {
+            "temperatura": (18.0, 30.0),
+            "humedad": (45.0, 75.0),
+            "nitrogeno": (10, 50),
+            "fosforo": (15, 60),
+            "potasio": (40, 250),
+            "humedad_suelo": (15.0, 45.0),
+            "temperatura_suelo": (20.0, 30.0),
+            "conductividad": (50, 400),
+            "ph": (5.8, 6.8),
+        }
+        
+        valores_actuales = {
+            "temperatura": t, "humedad": h, "nitrogeno": n, "fosforo": p,
+            "potasio": k, "humedad_suelo": hum_s, "temperatura_suelo": temp_s,
+            "conductividad": ec, "ph": ph
+        }
+        
+        causas = []
+        for var, (vmin, vmax) in RANGES_SANA.items():
+            val = valores_actuales[var]
+            if val < vmin:
+                causas.append(f"{var.capitalize()} baja: {val} (Mínimo normal: {vmin})")
+            elif val > vmax:
+                causas.append(f"{var.capitalize()} alta: {val} (Máximo normal: {vmax})")
+
+        # Fallback por si la anomalía detectada por el RF es multivariable y no rompe ningún umbral estricto individual
+        descripcion = " | ".join(causas) if causas else f"Anomalía general indefinida, revisar valores. Confianza: {confianza*100:.1f}%."
+
+        with sqlite3.connect(SQLITE_DB, timeout=10) as conn:
+            conn.execute("""
+                INSERT INTO alertas (nodo_id, timestamp, tipo, puntuacion, severidad, descripcion, estado)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (nodo_id, timestamp, prediccion, confianza, severidad, descripcion, "Activa"))
+            conn.commit()
             
-            solicitar_sincronizacion()
+        solicitar_sincronizacion()
             
     except Exception as e:
-        print(f"[ML] Error evaluando anomalía: {e}")
-
+        print(f"[ML] Error evaluando anomalía con Random Forest: {e}")
+        
 def _reconstruir_dato(row):
     return {
         "tipo": "lectura",
@@ -1215,7 +1237,6 @@ def sincronizar_estados_alertas_con_nube():
             
             url = _cloud_url(f"/api/nodos/{nodo_numero}/alertas")
             
-            # Solución al 401: Para un GET, enviamos SOLO el X-API-Key, sin el Content-Type
             headers_get = {"X-API-Key": CLOUD_API_KEY}
             
             respuesta = requests.get(url, headers=headers_get, timeout=CLOUD_TIMEOUT)
@@ -1226,7 +1247,6 @@ def sincronizar_estados_alertas_con_nube():
             
             cuerpo = respuesta.json()
             
-            # Solución de estructura: Extraemos directamente la clave "datos"
             alertas_nube = cuerpo.get("datos", [])
             
             if not isinstance(alertas_nube, list):
@@ -1241,7 +1261,6 @@ def sincronizar_estados_alertas_con_nube():
                     timestamp = al_nube.get("timestamp")
                     
                     if estado_nube and timestamp:
-                        # Solo actualizamos (y contamos) si el estado recibido es diferente al local
                         cursor.execute(
                             "UPDATE alertas SET estado = ? WHERE nodo_id = ? AND timestamp = ? AND estado != ?",
                             (estado_nube, nodo_id, timestamp, estado_nube)
@@ -1249,7 +1268,6 @@ def sincronizar_estados_alertas_con_nube():
                         cambios += cursor.rowcount
                 conn.commit()
             
-            # Refrescar la interfaz gráfica de Flet de inmediato si se detectaron modificaciones
             if cambios > 0:
                 print(f"[SYNC-ALERTAS] ¡Éxito! Se actualizaron {cambios} alertas de {nodo_id}.")
                 notificar_actualizacion()
@@ -1275,7 +1293,6 @@ def sincronizador_configuraciones_iniciar():
             _config_sync_event.wait(timeout=CONFIG_CLOUD_SYNC_INTERVAL)
             _config_sync_event.clear()
             try:
-                # Sincronización combinada del Cloud Interval
                 sincronizar_configuraciones_con_nube()
                 sincronizar_estados_alertas_con_nube()
             except Exception as e:
@@ -1399,7 +1416,7 @@ def http_photo_server_iniciar():
 # ══════════════════════════════════════════════════════════════════════
 #  FASTAPI — API REST EXCLUSIVAMENTE (INTERFAZ WEB REMOVIDA)
 # ══════════════════════════════════════════════════════════════════════
-app = FastAPI(title="AgroTech API", version="4.0")
+app = FastAPI(title="AgroTech API", version="4.1")
 
 class ConfigHorarioAPI(BaseModel):
     horarios: list[str]
@@ -1428,7 +1445,6 @@ def api_historial(nodo_id: str, limite: int = 100):
     datos = sqlite_historial(nodo_id, limite)
     return {"nodo_id": nodo_id, "cantidad": len(datos), "datos": datos}
 
-# Nuevo endpoint de alertas para la API
 @app.get("/api/nodos/{nodo_id}/alertas")
 def api_alertas_nodo(nodo_id: str):
     _validar_nodo(nodo_id)
@@ -1640,7 +1656,7 @@ def build_inicio(on_inicio):
                             padding=ft.Padding.symmetric(horizontal=32,vertical=12),elevation=10),
                         on_click=on_inicio, width=220),
                     ft.Container(height=20),
-                    ft.Text("v4.0.2 · Quindío, Colombia",size=11,
+                    ft.Text("v4.1.0 · Quindío, Colombia",size=11,
                             color=ft.Colors.with_opacity(0.35,ft.Colors.WHITE)),
                 ], alignment=ft.MainAxisAlignment.CENTER,
                    horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)),
@@ -1760,7 +1776,6 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                 estado_alerta = al[5]
                 severidad = al[3]
                 
-                # Modificamos los colores dependiendo de la información sincada de la nube
                 if estado_alerta == "Resuelta":
                     color_icono = C["verde"]
                     icono = ft.Icons.CHECK_CIRCLE
@@ -1783,7 +1798,7 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
                                     ft.Text(al[0], size=9, color=C["gris_texto"]),
                                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, expand=True),
                                 ft.Text(al[4], size=11, color=C["negro_texto"]),
-                                ft.Text(f"Tipo: {al[1]} | Score ML: {al[2]:.3f} | Estado: {estado_alerta}", size=9, color=C["gris_texto"])
+                                ft.Text(f"Tipo: {al[1]} | Confianza RF: {al[2]*100:.1f}% | Estado: {estado_alerta}", size=9, color=C["gris_texto"])
                             ], spacing=2, expand=True)
                         ])
                     )
@@ -1895,7 +1910,7 @@ def build_dashboard(nodo, page, on_volver, on_config, on_historico):
     vista_alertas = ft.Container(border_radius=12, bgcolor=C["fondo"],
         border=ft.Border.all(1, C["rojo"]), padding=ft.Padding.all(8),
         content=ft.Column([
-            sec_header(ft.Icons.NOTIFICATION_IMPORTANT, "Alertas ML", "Isolation Forest - Detección de Anomalías", C["rojo"]),
+            sec_header(ft.Icons.NOTIFICATION_IMPORTANT, "Alertas ML", "Random Forest - Clasificación", C["rojo"]),
             ft.Divider(color=C["rojo"], height=1),
             contenedor_alertas
         ], spacing=4, expand=True))
@@ -2844,7 +2859,7 @@ def build_historico(nodo, page, on_volver):
 #  APLICACIÓN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════
 def main(page: ft.Page):
-    page.title = "AgroTech Dashboard v4.0.2"
+    page.title = "AgroTech Dashboard v4.1.0"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
     try:
@@ -2857,8 +2872,6 @@ def main(page: ft.Page):
     cont = ft.Container(expand=True)
 
     sqlite_iniciar()
-    # Entrenar modelo de anomalías si existen suficientes datos sanos.
-    #entrenar_modelo_iforest()
     aplicar_limpieza_almacenamiento()
     sincronizador_iniciar()
 
