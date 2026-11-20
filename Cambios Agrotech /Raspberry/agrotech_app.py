@@ -1,7 +1,8 @@
 """
 AgroTech Dashboard + FastAPI — Compatible con Flet 0.84+
 v4.1.0 — Cambios principales:
-- Clasificación de anomalías mediante Random Forest supervisado (13 Dimensiones).
+- Clasificación de anomalías mediante Random Forest supervisado sobre una reducción PCA (3D).
+- Las 13 características se reducen a 3 componentes (Nutrientes, Suelo, Ambiente) antes de entrar al modelo.
 - Integración de variables temporales cíclicas (seno/coseno).
 - Descripción dinámica basada en reglas agronómicas (Tomate).
 - Sin alertas falsas: Solo envía eventos cuando se clasifica como anomalía.
@@ -64,7 +65,9 @@ DEFAULT_MAX_STORAGE_MB = 512
 DEFAULT_DELETE_COUNT = 100
 os.makedirs(DATA_DIR, exist_ok=True)
 
-MODELO_ML_PATH = os.path.join(DATA_DIR, "rf_model.joblib")
+# Paquete exportado por el cuaderno de entrenamiento (PCA 3D): contiene el Random Forest
+# junto con los escaladores y PCA con los que fue entrenado.
+MODELO_ML_PATH = os.path.join(DATA_DIR, "rf_model_pca.joblib")
 
 
 def cargar_config_almacenamiento():
@@ -338,16 +341,47 @@ def guardar_sqlite(nodo_id, dato, timestamp):
         return None
 
 # ══════════════════════════════════════════════════════════════════════
-#  MACHINE LEARNING — RANDOM FOREST
+#  MACHINE LEARNING — RANDOM FOREST (ENTRADA: REDUCCIÓN PCA 3D)
 # ══════════════════════════════════════════════════════════════════════
 
+# Elementos que debe contener el paquete exportado por el cuaderno de entrenamiento
+CLAVES_PAQUETE_ML = (
+    "rf", "features_pca",
+    "scaler_nut", "scaler_suelo", "scaler_amb",
+    "pca_nut", "pca_suelo", "pca_amb",
+    "grupo_nutrientes", "grupo_suelo", "grupo_ambiente",
+)
+
+
+def _proyectar_pca(vector, paquete):
+    """Reduce las 13 características (DataFrame) a las 3 componentes PCA que recibe el modelo.
+
+    Usa los mismos escaladores y PCA ajustados durante el entrenamiento (guardados en el paquete),
+    por lo que la transformación es idéntica a la del cuaderno.
+    """
+    componentes = pd.DataFrame({
+        "Comp_Nutrientes": paquete["pca_nut"].transform(
+            paquete["scaler_nut"].transform(vector[paquete["grupo_nutrientes"]])).ravel(),
+        "Comp_Suelo": paquete["pca_suelo"].transform(
+            paquete["scaler_suelo"].transform(vector[paquete["grupo_suelo"]])).ravel(),
+        "Comp_Ambiente": paquete["pca_amb"].transform(
+            paquete["scaler_amb"].transform(vector[paquete["grupo_ambiente"]])).ravel(),
+    })
+    return componentes[paquete["features_pca"]]
+
+
 def evaluar_anomalias(nodo_id, timestamp, registro):
-    """Evalúa la medición actual en busca de anomalías y genera alertas usando Random Forest."""
+    """Evalúa la medición actual en busca de anomalías y genera alertas usando Random Forest (sobre PCA 3D)."""
     if not os.path.exists(MODELO_ML_PATH):
         return
 
     try:
-        modelo = joblib.load(MODELO_ML_PATH)
+        paquete = joblib.load(MODELO_ML_PATH)
+        if not isinstance(paquete, dict) or any(c not in paquete for c in CLAVES_PAQUETE_ML):
+            print(f"[ML] '{os.path.basename(MODELO_ML_PATH)}' no es el paquete PCA 3D esperado "
+                  f"(RF + escaladores + PCA, exportado por el cuaderno de entrenamiento). Se omite la evaluación.")
+            return
+        modelo = paquete["rf"]
         
         dht = registro.get("dht", {})
         suelo = registro.get("suelo", {})
@@ -378,14 +412,17 @@ def evaluar_anomalias(nodo_id, timestamp, registro):
         # SOLUCIÓN 1: Usar un DataFrame de Pandas con los nombres exactos para evitar el UserWarning
         nombres_caracteristicas = ['nitrogeno', 'fosforo', 'potasio', 'ph', 'conductividad', 'humedad_suelo', 'temperatura_suelo', 'temperatura', 'humedad', 'hora_sin', 'hora_cos', 'mes_sin', 'mes_cos']
         vector = pd.DataFrame([[n, p, k, ph, ec, hum_s, temp_s, t, h, hora_sin, hora_cos, mes_sin, mes_cos]], columns=nombres_caracteristicas)
+
+        # Reducción dimensional: 13 características -> 3 componentes PCA (entrada real del modelo)
+        vector_pca = _proyectar_pca(vector, paquete)
         
-        prediccion = modelo.predict(vector)[0]
+        prediccion = modelo.predict(vector_pca)[0]
         
         if prediccion == 'Sin anomalías (Sana)':
             return
 
         try:
-            probabilidades = modelo.predict_proba(vector)[0]
+            probabilidades = modelo.predict_proba(vector_pca)[0]
             confianza = float(max(probabilidades))
         except AttributeError:
             confianza = 0.99
